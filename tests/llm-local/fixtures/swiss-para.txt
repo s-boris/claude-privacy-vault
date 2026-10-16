@@ -1,0 +1,13 @@
+### Swiss German eval set (policy v4.1): the two lines from the 13.10 live test + synthetic dialect lines
+[2026-10-12 18:02] Mia: Da meh nid chan reserviere müendmer scho so früeh gah (#1)
+[2026-10-12 18:03] Mia: dassmer am 4i scho gnueg lüt sind (#2)
+[2026-10-12 18:05] Noah: Mir träffed eus am Samstig am halbi 5 bim Bahnhof Winterthur (#3)
+[2026-10-12 18:06] Lea: Ich chume nöd vor de 17i, de Zug isch usgfalle (#4)
+[2026-10-12 18:07] Noah: Am 24. Oktober isch d Hochziit, mir gönd am vieri los (#5)
+[2026-10-12 18:08] Lea: Chasch du bis am Fritig 2 Tickets für de Match organisiere? (#6)
+[2026-10-12 18:09] Mia: Mir händ kei Platz meh im Auto, nimm de Zug um 8 (#7)
+[2026-10-12 18:10] Noah: Es git nüt meh z Ässe nach de 22i (#8)
+[2026-10-12 18:11] Lea: Nöd vergässe, am 3.11. isch d Abgab vom Projekt (#9)
+[2026-10-12 18:12] Mia: Ich ha nie gseit dass ich am 12. chume (#10)
+[2026-10-12 18:13] Noah: Mir sind ab 8i dete und blibed bis am zwölfi (#11)
+[2026-10-12 18:14] Lea: De Flug gaht am 21.11. am 06:15, mir müend am 4i ufstah (#12)

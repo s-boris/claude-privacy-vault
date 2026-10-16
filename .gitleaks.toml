@@ -1,0 +1,8 @@
+# gitleaks: default rules + an allowlist for values planted on purpose in tests (none of them is a credential).
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Planted test fakes"
+regexTarget = "line"
+regexes = ['''abcDEF123456''']

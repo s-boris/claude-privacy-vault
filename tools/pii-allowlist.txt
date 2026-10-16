@@ -1,0 +1,25 @@
+# Known test fakes, documentation examples (SIX/ISO example IBANs, the official AHV example) and corporate
+# sender addresses used in fixtures. Normalized (lowercase, no spaces/dots/dashes). Reviewed 2026-10-15.
+0765551234
+0787654321
+0790001234
+0791234567
+0795556677
+0797654321
+7561234567897
+a@bch
+annamuster@gmailcom
+annamuster@gmxch
+billing@swisscomch
+ch4431999123000889012
+ch5604835012345678009
+ch5800791123000889012
+ch9300762011623852957
+de89370400440532013000
+lenabrunner92@gmailcom
+name@gmailcom
+news@digitecch
+no_reply@emailapplecom
+noreply@postch
+rechnung@newsgalaxusch
+x@ych

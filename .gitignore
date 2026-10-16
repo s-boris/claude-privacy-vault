@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+*.session
+/data/
+
+# the owner's private Firefly sync rules: they live only in the vault (/data/finance), never in git
+firefly_rules.json
+*.private.json

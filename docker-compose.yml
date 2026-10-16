@@ -1,0 +1,47 @@
+# claude-vault: the owner's privacy vault. Reachable ONLY from containers on the
+# Docker network src_default (the assistant: http://claude-vault:8300). No ports are published to the LAN.
+# Managed from the assistant's container: `vault admin deploy|ps|logs|restart` (source in ~/opt/claude-vault).
+name: claude-vault
+services:
+  vault:
+    build: .
+    image: claude-vault:local
+    container_name: claude-vault
+    hostname: claude-vault
+    restart: always
+    init: true
+    user: "10001:10001"              # the vault's user, whatever the image says
+    env_file: [vault.env, .env]      # vault.env (repo): the vault's settings. .env (0600, this server):
+                                     # VAULT_TOKEN_SHA256 (the token lives in the assistant's ~/.secrets) + this
+                                     # server's deployment values (.env.example; vault admin env-add). The later file
+                                     # wins: this server's .env. A Telegram-approved deploy may change vault.env
+                                     # (VAULT_NAME=value lines), never .env.
+    networks: [src_default]
+    volumes:
+      - data:/data                   # raw data, secrets, old model, audit log; never mounted anywhere else
+      # Local LLM weights (2026-10-14, Gemma-4-26B-A4B, 14 GB of public files, sha256-checked by the vault before
+      # llama-server may load them): on the data pool, NOT in docker.img (50 GB, Unraid warns at 70%), read-only.
+      # `vault admin deploy` seeds the dir (reflink copy from the assistant's ~/opt/llm-models, else download).
+      - ${VAULT_MODELS_DIR:-./models}:/models:ro
+      # Deploy mailbox (Telegram-approved deploys, app/deploys.py): the vault writes deploy requests, the host runner
+      # (vault-deploy-runner.sh: root, every minute, prepares both folders) reads them and writes the results.
+      - ${VAULT_DEPLOY_DIR:-/mnt/user/appdata/claude-vault-mailbox}/requests:/deploy/requests
+      - ${VAULT_DEPLOY_DIR:-/mnt/user/appdata/claude-vault-mailbox}/results:/deploy/results:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 512
+    cpus: ${VAULT_CPUS:-8}
+    cpuset: "${VAULT_CPUSET:-0-7}"   # pin the local LLM to your fast cores
+    mem_limit: ${VAULT_MEM_LIMIT:-22g}                   # Gemma-4-26B-A4B peaks at 19.2 GB incl. mmapped weights (12g with Qwen3.5-9B)
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+volumes:
+  data:
+    name: claude-vault_data
+networks:
+  src_default:
+    external: true

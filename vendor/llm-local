@@ -1,0 +1,2375 @@
+#!/usr/bin/python3 -I
+"""llm-local: ask the LOCAL LLM (llama.cpp llama-server on 127.0.0.1:8179). Never calls a remote API.
+
+  echo "prompt" | llm-local [--system TEXT] [--max-tokens N] [--json] [--temp T] [--stats]
+  llm-local --anonymize [--strict] [--owner-name NAME] [--summary] [--stats] < private.txt
+
+Default mode: stdin is the user prompt, the answer goes to stdout. --json asks for a JSON object
+(grammar-constrained) and prints it validated, on one line.
+
+--anonymize: stdin text -> stdout with the
+same lines, order and wording. KEPT verbatim: names (no aliases), street addresses, places, venues and the facts
+(topics, plans, meetings, trips, events, decisions, dates, times, who said what; small everyday shared costs and
+bill due dates). REDACTED: intimate or personal passages that don't belong in front of a third-party AI assistant ->
+"[private: health | mental health | sexual | dating | relationship | family | money | business | confidential |
+gossip]" (the sentence or message part; the rest of the message stays). money = anyone's finances, the owner's
+included: salary, savings, investments, portfolio and trading plans, amounts held/invested/earned/owed, debts, bank
+details, purchases and their sums, negotiated prices; business = deals, a company or side business, clients,
+revenue. MASKED: identifiers -> [phone], [email], [IBAN], [account number], [card number], [AHV number], [ID number],
+[secret] (passwords, PINs, codes), [license plate], [birthdate], [link: domain], @[user]; a surname only when its
+person is attached to a redacted passage -> [surname]. The owner (--owner-name) -> "You".
+The model only DETECTS (grammar-constrained JSON, chunk by chunk): it quotes private sentences with a category and
+identifiers with a type. The replacement is done here in code on the original text: quotes are found exactly, then
+case/space/punctuation-blind, then by anchor words, then by the best-matching line, and widened to whole sentences;
+chat prefixes ("[ts] Name: ") and tgread line tails stay. A regex safety pass then catches phones, emails, IBANs,
+account, card and AHV numbers, Swiss plates, birthdates next to "geboren/born", passwords/PINs/codes after a
+keyword and token links the model missed, and money amounts -> [amount]: any currency amount from 5'000 up, and
+every amount on the same line near a money/business/payment word (Lohn, salary, invest, ETF, Tranche, Deal, Umsatz,
+paid, bezahlt, TWINT, receipt, ...) or right after an amount label ("Total:", "Betrag", "amount due").
+--all-amounts: the owner's own mail: every currency amount of any size, every labelled number and bare cents
+that can't be a time -> [amount] (the vault sets it for Gmail search, get and events).
+--keep-own-money: admin documents (the owner's own bills, payslips, tax papers in paperless): only debts and money
+troubles are private, no business category, no [amount] net.
+--strict: maximum anonymity on top of the private-passage redaction: a second, strict detector also runs
+(about twice the detection time), private people -> "Person A/B/..." (consistent across chunks), home addresses ->
+[address], home/work locations -> [location].
+--summary: anonymize (with --strict if given), then write a detailed summary of the anonymized text (the model never
+sees the removed data in that step); --system adds instructions to that summary.
+--paraphrase (summarize and paraphrase every message without changing any meaning,
+numbers or facts; all remaining redactions still apply): after the anonymization, every message body (chat lines
+between '[ts] Name: ' and the ref tail; mail subjects and paragraphs) becomes a short, neutral paraphrase IN ITS OWN LANGUAGE that
+keeps every fact, name, place, date, time and number, in one call per batch. No
+translation: the paraphrase keeps the item's language and dialect (Swiss German stays Swiss German,
+Standard German stays Standard German). Checked in code per message: numbers,
+weekdays, months and today/tomorrow/yesterday must occur in its anonymized text, the [placeholders] must be the same,
+a clock time stays a time and a date stays a date (Swiss "am 4i" never becomes "the 4th"), a negated sentence keeps a
+negation, and the language stays;
+one retry, then the anonymized text marked "[not paraphrased]". Headers, refs, senders and times stay as they are; the
+regex and money nets run again. With --summary: each summary line is checked the same way (one retry, then left out).
+
+The server is started on demand (llm-server-ctl start) unless --no-start. Exit codes: 0 ok, 2 usage,
+3 local LLM unavailable, 4 bad response / request rejected (e.g. too long), 5 timeout.
+Backend: "vault" in ~/.config/llm-local/backend (or env LLM_LOCAL_BACKEND=vault) runs everything through the privacy
+vault instead (`vault llm-run -- ARGS`: the same llm-local and model inside container claude-vault); "local" or no
+file = this box's llama-server.
+Env (tests): LLM_LOCAL_PORT, LLM_LOCAL_CTL, LLM_LOCAL_BACKEND, LLM_LOCAL_VAULT_BIN. LLM_LOCAL_STATS_FILE (the vault): one
+JSON line of numbers per run (tokens processed/reused, seconds, cache hits), for its health metrics. LLM_LOCAL_TICKET (the
+vault): sent as X-LLM-Ticket; the vault's LLM proxy gates each model request with it.
+"""
+import argparse
+import base64
+import bisect
+import hashlib
+import hmac
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+sys.dont_write_bytecode = True
+
+PORT = int(os.environ.get("LLM_LOCAL_PORT", "8179"))
+BASE = "http://127.0.0.1:%d" % PORT          # loopback only, by construction
+CTL = os.environ.get("LLM_LOCAL_CTL", os.path.expanduser("~/bin/llm-server-ctl"))
+# The privacy vault's per-request LLM gate: its proxy admits a request only with the ticket of an open LLM job.
+TICKET = os.environ.get("LLM_LOCAL_TICKET", "")
+# No proxies: an http_proxy in the environment must never route private text off the box.
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+STATS = []
+
+
+class LLMError(Exception):
+    def __init__(self, msg, code=4):
+        super().__init__(msg)
+        self.code = code
+
+
+def die(msg, code):
+    print("llm-local: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------- server access
+def http(path, body=None, timeout=10):
+    data = None if body is None else json.dumps(body).encode()
+    headers = {"Content-Type": "application/json"}
+    if TICKET:
+        headers["X-LLM-Ticket"] = TICKET
+    req = urllib.request.Request(BASE + path, data=data, headers=headers)
+    try:
+        with OPENER.open(req, timeout=timeout) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.load(e).get("error", {})
+            detail = detail.get("message", detail) if isinstance(detail, dict) else detail
+        except Exception:
+            detail = e.reason
+        raise LLMError("server rejected the request (HTTP %d): %s" % (e.code, detail), 4)
+    except TimeoutError:
+        raise LLMError("timed out after %ds" % timeout, 5)
+    except (urllib.error.URLError, ConnectionError, OSError) as e:
+        reason = getattr(e, "reason", e)
+        if isinstance(reason, TimeoutError) or "timed out" in str(reason):
+            raise LLMError("timed out after %ds" % timeout, 5)
+        raise LLMError("cannot reach the local LLM at %s (%s)" % (BASE, reason), 3)
+
+
+def healthy():
+    try:
+        return http("/health", timeout=3).get("status") == "ok"
+    except LLMError:
+        return False
+
+
+def ensure_server(no_start):
+    if healthy():
+        return
+    if no_start:
+        raise LLMError("local LLM server is not running (start it: llm-server-ctl start)", 3)
+    # stderr to a temp file, not a pipe: a server child that inherits a pipe would block us until it exits
+    with tempfile.TemporaryFile(mode="w+") as err:
+        try:
+            p = subprocess.run([CTL, "start"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err,
+                               timeout=300)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise LLMError("could not start the local LLM server: %s" % e, 3)
+        err.seek(0)
+        msg = err.read().strip().splitlines()
+    if p.returncode != 0 or not healthy():
+        raise LLMError("local LLM unavailable: %s" % (msg[-1] if msg else "llm-server-ctl start failed"), 3)
+
+
+def chat(messages, max_tokens=1024, temperature=0.7, schema=None, json_mode=False, timeout=1800,
+         presence=0.0, label="chat"):
+    body = {"messages": messages, "max_tokens": max_tokens, "temperature": temperature,
+            "top_p": 0.8, "top_k": 20, "min_p": 0.0, "presence_penalty": presence,
+            "cache_prompt": True, "chat_template_kwargs": {"enable_thinking": False}}
+    if schema is not None:
+        body["response_format"] = {"type": "json_schema", "json_schema": {"name": "out", "schema": schema}}
+    elif json_mode:
+        body["response_format"] = {"type": "json_object"}
+    t = time.time()
+    r = http("/v1/chat/completions", body, timeout=timeout)
+    try:
+        ch = r["choices"][0]
+        txt = ch["message"]["content"] or ""
+    except (KeyError, IndexError, TypeError):
+        raise LLMError("unexpected response from the local LLM", 4)
+    txt = re.sub(r"(?s)^\s*<think>.*?</think>\s*", "", txt).strip()
+    tm = r.get("timings") or {}
+    STATS.append({"step": label, "wall_s": round(time.time() - t, 1), "prompt_tokens": tm.get("prompt_n"),
+                  "cached_tokens": tm.get("cache_n"),
+                  "prompt_tps": round(tm.get("prompt_per_second") or 0, 1), "gen_tokens": tm.get("predicted_n"),
+                  "gen_tps": round(tm.get("predicted_per_second") or 0, 2),
+                  "prompt_s": round((tm.get("prompt_ms") or 0) / 1000, 2),
+                  "gen_s": round((tm.get("predicted_ms") or 0) / 1000, 2),
+                  "finish": ch.get("finish_reason")})
+    return txt, ch.get("finish_reason")
+
+
+def write_stats_line(path):
+    """One JSON line of numbers per run for the privacy vault's health metrics (env LLM_LOCAL_STATS_FILE): model
+    calls, prompt tokens processed vs reused from the server's prompt cache, generated tokens, prompt and generation
+    seconds, cache hits/misses. Never any text."""
+    def tot(k):
+        return sum(x.get(k) or 0 for x in STATS if isinstance(x.get(k), (int, float)))
+    d = {"ts": int(time.time()), "calls": len(STATS), "prompt_tokens": tot("prompt_tokens"),
+         "cached_tokens": tot("cached_tokens"), "gen_tokens": tot("gen_tokens"),
+         "prompt_s": round(tot("prompt_s"), 2), "gen_s": round(tot("gen_s"), 2)}
+    if CACHE_STATS:
+        d["cache"] = {k: list(v) for k, v in CACHE_STATS.items()}
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
+            f.write(json.dumps(d) + "\n")
+    except OSError:
+        pass
+
+
+CACHE_STATS = {}                                 # cache name -> [hits, misses] of this run
+
+
+def count_tokens(text):
+    try:
+        return len(http("/tokenize", {"content": text}, timeout=120).get("tokens", []))
+    except LLMError:
+        return len(text) // 3
+
+
+def ctx_size():
+    try:
+        p = http("/props", timeout=5)
+        return int(p.get("default_generation_settings", {}).get("n_ctx") or p.get("n_ctx") or 32768)
+    except (LLMError, ValueError, TypeError):
+        return 32768
+
+
+# ---------------------------------------------------------------- anonymization cache
+# --cache-dir DIR (or env LLM_LOCAL_CACHE_DIR; only with --anonymize/--summary): the privacy vault sets it for its own
+# private jobs, never for the caller's own text. Cached: the model's detection result per chunk, its check verdict per
+# sentence, and summaries. Keys: HMAC-SHA256 (key DIR/key, 0600) of the policy, the model, the cache kind and the full
+# request (system prompt, schema, user message, settings), so a policy, prompt or model change never hits an old
+# entry. Detections are stored as positions in the request text plus their enum categories/types, never as text; a
+# quote the model didn't copy verbatim is stored encrypted (HMAC-SHA256 keystream under the cache key, per entry and
+# string). Checks keep only the verdict; summaries and policy v4 paraphrase batches (built from anonymized text) their
+# answer, encrypted the same way. Every code step (locating and widening passages, the surname rule, the regex and money nets)
+# still runs on every call, so the output is the same as a fresh run. A corrupt entry is a miss: the work runs again,
+# never a fallback to raw text. CACHE_DAYS expiry, CACHE_MAX_BYTES size cap (oldest first).
+CACHE_DAYS = 30
+CACHE_MAX_BYTES = 200 * 1024 * 1024
+CACHE = None
+CACHE_KEYS = {"private", "identifiers", "text", "category", "about", "type", "people", "name", "variants", "pii"}
+CACHE_ENUMS = {"category", "type"}
+
+
+class NotCacheable(Exception):
+    pass
+
+
+def to_refs(obj, src, key=None, enc=None, ctr=None):
+    """Model output -> the same structure with every string as [position, length] in src (enums kept; a string not
+    in src encrypted with enc(n, bytes))."""
+    ctr = [0] if ctr is None else ctr
+    if isinstance(obj, dict):
+        if not all(k in CACHE_KEYS for k in obj):
+            raise NotCacheable()
+        return {k: to_refs(v, src, k, enc, ctr) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [to_refs(x, src, key, enc, ctr) for x in obj]
+    if isinstance(obj, str):
+        if key in CACHE_ENUMS and re.fullmatch(r"[a-z_]{1,24}", obj):
+            return {"e": obj}
+        if obj == "":
+            return {"@": [0, 0]}
+        i = src.find(obj)
+        if i >= 0:
+            return {"@": [i, len(obj)]}
+        if enc is None:
+            raise NotCacheable()
+        ctr[0] += 1
+        return {"x": base64.b64encode(enc(ctr[0], obj.encode("utf-8"))).decode("ascii")}
+    if obj is None or isinstance(obj, (bool, int, float)):
+        return obj
+    raise NotCacheable()
+
+
+def from_refs(obj, src, enc=None, ctr=None):
+    ctr = [0] if ctr is None else ctr
+    if isinstance(obj, dict):
+        if set(obj) == {"@"}:
+            i, n = obj["@"]
+            if not (isinstance(i, int) and isinstance(n, int) and 0 <= i and i + n <= len(src)):
+                raise ValueError("bad position")
+            return src[i:i + n]
+        if set(obj) == {"e"}:
+            return str(obj["e"])
+        if set(obj) == {"x"}:
+            if enc is None:
+                raise ValueError("no key")
+            ctr[0] += 1
+            return enc(ctr[0], base64.b64decode(obj["x"])).decode("utf-8")
+        if not all(k in CACHE_KEYS for k in obj):
+            raise ValueError("bad key")
+        return {k: from_refs(v, src, enc, ctr) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [from_refs(x, src, enc, ctr) for x in obj]
+    return obj
+
+
+class AnonCache:
+    def __init__(self, d):
+        self.dir = d
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        os.chmod(d, 0o700)
+        kp = os.path.join(d, "key")
+        try:
+            with open(kp, "rb") as f:
+                self.key = f.read()
+            if len(self.key) < 32:
+                raise OSError("short key")
+        except OSError:
+            self.key = os.urandom(32)
+            tmp = "%s.%d.tmp" % (kp, os.getpid())
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(self.key)
+            os.replace(tmp, kp)
+        try:
+            self.model = os.path.basename(str(http("/props", timeout=10).get("model_path") or "unknown"))
+        except (LLMError, AttributeError):
+            self.model = "unknown"
+
+    def crypt(self, entry):
+        """XOR with an HMAC-SHA256 keystream per (entry, string number): encrypts and decrypts."""
+        ek = hmac.new(self.key, b"llm-local cache encryption", hashlib.sha256).digest()
+
+        def f(n, data):
+            out, blk = bytearray(), 0
+            while len(out) < len(data):
+                out += hmac.new(ek, ("%s/%d/%d" % (entry, n, blk)).encode(), hashlib.sha256).digest()
+                blk += 1
+            return bytes(a ^ b for a, b in zip(data, out))
+        return f
+
+    def seal(self, k, text):
+        """Text built from anonymized text (summaries, paraphrases) -> an encrypted entry (keystream number 0)."""
+        return {"x": base64.b64encode(self.crypt(k)(0, text.encode("utf-8"))).decode("ascii")}
+
+    def unseal(self, k, data):
+        """seal()'s entry -> the text, or None (a miss) if it is missing or unreadable."""
+        try:
+            if isinstance(data, dict) and isinstance(data.get("x"), str):
+                return self.crypt(k)(0, base64.b64decode(data["x"], validate=True)).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            pass
+        return None
+
+    def key_for(self, kind, req):
+        blob = json.dumps([POLICY, self.model, kind, req], sort_keys=True, ensure_ascii=False)
+        return hmac.new(self.key, blob.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def path(self, kind, k):
+        return os.path.join(self.dir, kind, k[:2], k + ".json")
+
+    def get(self, kind, k):
+        p = self.path(kind, k)
+        try:
+            if time.time() - os.stat(p).st_mtime > CACHE_DAYS * 86400:
+                os.unlink(p)
+                raise OSError("expired")
+            with open(p, encoding="utf-8") as f:
+                d = json.load(f)
+            if not (isinstance(d, dict) and d.get("v") == 1 and "data" in d):
+                raise ValueError("bad entry")
+        except (OSError, ValueError):
+            CACHE_STATS.setdefault(kind, [0, 0])[1] += 1
+            return None
+        CACHE_STATS.setdefault(kind, [0, 0])[0] += 1
+        return d["data"]
+
+    def put(self, kind, k, data):
+        p = self.path(kind, k)
+        try:
+            for sub in (os.path.join(self.dir, kind), os.path.dirname(p)):    # each level 0700 (makedirs' mode
+                try:                                                          # covers only the last one)
+                    os.mkdir(sub, 0o700)
+                except FileExistsError:
+                    pass
+            tmp = "%s.%d.tmp" % (p, os.getpid())
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"v": 1, "data": data}, f, ensure_ascii=False, separators=(",", ":"))
+            os.replace(tmp, p)
+        except OSError:
+            pass
+
+    def prune(self):
+        """At most once an hour: drop expired entries, then the oldest until the cache is under CACHE_MAX_BYTES."""
+        mark = os.path.join(self.dir, ".pruned")
+        try:
+            if time.time() - os.stat(mark).st_mtime < 3600:
+                return
+        except OSError:
+            pass
+        files, total, now = [], 0, time.time()
+        for root, _dirs, names in os.walk(self.dir):
+            for n in names:
+                if n.endswith(".json"):
+                    fp = os.path.join(root, n)
+                    try:
+                        st = os.stat(fp)
+                    except OSError:
+                        continue
+                    if now - st.st_mtime > CACHE_DAYS * 86400:
+                        try:
+                            os.unlink(fp)
+                        except OSError:
+                            pass
+                        continue
+                    files.append((st.st_mtime, st.st_size, fp))
+                    total += st.st_size
+        for _mt, size, fp in sorted(files):
+            if total <= CACHE_MAX_BYTES:
+                break
+            try:
+                os.unlink(fp)
+                total -= size
+            except OSError:
+                pass
+        try:
+            os.close(os.open(mark, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600))
+            os.utime(mark)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------- anonymization
+# Policy v3: first names, addresses, places and the non-financial facts stay
+# verbatim; intimate or personal passages, and anyone's money or business details (the owner's own included), are
+# replaced by "[private: <category>]"; identifiers are masked; a surname is masked only when its person is attached
+# to a redacted passage. --strict: the old policy (all names aliased, addresses/locations masked) plus the
+# private-passage redaction. --keep-own-money (the owner's admin documents): the v2 money rule, no business category.
+POLICY = "llm-local-v4.1+regex-2026-10-13"
+PRIVATE_CATEGORIES = ["health", "mental_health", "sexual", "dating", "relationship", "family", "money", "business",
+                      "confidential", "gossip"]
+ADMIN_CATEGORIES = [c for c in PRIVATE_CATEGORIES if c != "business"]
+_MONEY_V3 = ("money: money and finances of anyone, the owner included: salary, income, bonus, savings, wealth, account "
+             "balances, investments, portfolio, stocks, ETFs, crypto, trades and investment plans, amounts someone holds, "
+             "invests, earns, lends, borrows or owes, debts, money problems, debt collection, bank details, purchases and "
+             "what they cost (beyond small everyday costs), prices someone negotiates, taxes someone pays")
+_BUSINESS_V3 = ("business: business deals, contracts and negotiations, a company, side business or self-employment, "
+                "clients, revenue, profit, offers and quotes, bulk purchases and resale")
+_MONEY_V2 = "money: someone's debts, money problems, debt collection, being unable to pay rent or bills"
+_KEEP_V3 = ("plans, meetings, dates, times, places, venues, travel and trips, events, bills and their due dates, "
+            "splitting small everyday costs (pizza, drinks, tickets, a gift collection) and the small amounts friends "
+            "owe each other for them, presents")
+_KEEP_V2 = ("plans, meetings, dates, times, places, venues, travel, prices, splitting costs, small amounts friends owe "
+            "each other (pizza, tickets, gifts), presents")
+_PRIVATE_RULES = """"private": every sentence that reveals intimate or very personal matters that do not belong in front of an outside AI assistant, about the writer or about someone else:
+- health: illness, diagnosis, injury, symptoms, medication, treatment, surgery, pregnancy, medical test results
+- mental_health: depression, anxiety, panic attacks, burnout, therapy, psychiatrist, self-harm, addiction
+- sexual: sex, sexual orientation, intimate or body details
+- dating: dates, crushes, hookups, dating apps, who is seeing or sleeping with whom
+- relationship: breakups, cheating, a couple's fights, divorce, jealousy
+- family: conflicts within a family, family members' private problems
+- %(money)s%(business)s
+- confidential: a personal secret told in confidence ("don't tell anyone", "unter üs")
+- gossip: crude or mean personal gossip about someone (looks, drinking, sex life, private life)
+For each: "text" = the whole sentence copied EXACTLY as written (a verbatim substring), "category" = one of the categories above, "about" = the name of the person it is about, exactly as written, or "" if it is about the writer.
+NOT private, never list: %(keep)s, surprise parties and other surprises, work and school logistics, exams, looking for a doctor or dentist, appointments without medical details, sports, weather, food, jokes, being tired or hungover, everyday moods (happy, stressed, annoyed). Most messages are not private."""
+PRIVATE_RULES = _PRIVATE_RULES % {"money": _MONEY_V3, "business": "\n- " + _BUSINESS_V3, "keep": _KEEP_V3}
+PRIVATE_RULES_ADMIN = _PRIVATE_RULES % {"money": _MONEY_V2, "business": "", "keep": _KEEP_V2}
+
+DETECT_SYSTEM = """You check text before it is shown to an outside AI assistant. The text can be German, Swiss German or English: chat logs, emails, notes, documents. Names, street addresses, places and normal facts are fine and must NOT be listed. Answer with JSON only.
+
+""" + PRIVATE_RULES + """
+
+"identifiers": every item of these kinds, "text" copied EXACTLY as it appears (a verbatim substring), with a "type":
+- phone: phone numbers
+- email: email addresses
+- iban: IBANs, bank or postal account numbers
+- card: credit/debit card numbers
+- ahv: AHV/AVS/social security numbers
+- id: passport, ID card, customer, insurance policy, tax or other personal ID numbers
+- secret: passwords, PINs, door codes, one-time or login codes
+- link: links with tokens, share IDs, invite codes or personal IDs
+- plate: vehicle license plates
+- birthdate: a date of birth with year (e.g. "18.10.1996")
+Do NOT list as identifiers: names, street addresses, cities, venues, dates and times of events, amounts and prices, shop order numbers."""
+
+DETECT_SYSTEM_ADMIN = DETECT_SYSTEM.replace(PRIVATE_RULES, PRIVATE_RULES_ADMIN)
+
+# --strict: the pre-v2 detector (people + personal data), unchanged; it runs next to DETECT_SYSTEM, which supplies the
+# private passages (one combined prompt made the 9B model skip some of them).
+DETECT_SYSTEM_STRICT = """You find personal data in text so that it can be removed. The text can be German, Swiss German or English: chat logs, emails, notes, documents. Answer with JSON only.
+
+"people": every PRIVATE individual who writes or is mentioned: first names, full names, surnames with a title (e.g. "Herr Huber", "Dr. Frei"), nicknames, @usernames. For each person: "name" = the most complete form seen, "variants" = every other form of that person's name that appears in the text, copied exactly as written. If a person is already in the known-people list, use exactly that "name". Do NOT list well-known public figures (celebrities, athletes, artists, DJs, politicians), companies, shops, bars, restaurants, venues, brands, streets or places, and not relationship words alone (Mama, Chef, boss).
+
+"pii": every other item of personal data, each "text" copied EXACTLY as it appears (a verbatim substring), with a "type":
+- phone: phone numbers
+- email: email addresses
+- address: home or private street addresses (street + number, postcode)
+- iban: IBANs, bank account numbers
+- card: credit/debit card numbers
+- ahv: AHV/AVS/social security numbers
+- id: passport, ID card, customer, insurance policy, tax or other personal ID numbers; passwords, PINs, door codes
+- birthdate: a date of birth with year (e.g. "18.10.1996")
+- location: an exact home or workplace location described in words
+- plate: vehicle license plates
+- link: links with tokens, share IDs, invite codes or personal IDs
+
+Do NOT list: dates and times of events or plans, amounts and prices, cities and countries, public venues, shops, bars, stadiums, public streets mentioned as meeting points, shop order numbers, topics, opinions. When unsure whether something is a private person or a public figure, list it as a person."""
+
+def detect_schema(categories):
+    return {
+        "type": "object",
+        "properties": {
+            "private": {"type": "array", "items": {"type": "object", "properties": {
+                "text": {"type": "string"}, "category": {"type": "string", "enum": categories},
+                "about": {"type": "string"}}, "required": ["text", "category", "about"]}},
+            "identifiers": {"type": "array", "items": {"type": "object", "properties": {
+                "text": {"type": "string"},
+                "type": {"type": "string", "enum": ["phone", "email", "iban", "card", "ahv", "id", "secret", "link",
+                                                    "plate", "birthdate"]}},
+                "required": ["text", "type"]}},
+        },
+        "required": ["private", "identifiers"],
+    }
+
+
+DETECT_SCHEMA = detect_schema(PRIVATE_CATEGORIES)
+DETECT_SCHEMA_ADMIN = detect_schema(ADMIN_CATEGORIES)
+DETECT_SCHEMA_STRICT = {
+    "type": "object",
+    "properties": {
+        "people": {"type": "array", "items": {"type": "object", "properties": {
+            "name": {"type": "string"}, "variants": {"type": "array", "items": {"type": "string"}}},
+            "required": ["name", "variants"]}},
+        "pii": {"type": "array", "items": {"type": "object", "properties": {
+            "text": {"type": "string"},
+            "type": {"type": "string", "enum": ["phone", "email", "address", "iban", "card", "ahv", "id",
+                                                "birthdate", "location", "plate", "link"]}},
+            "required": ["text", "type"]}},
+    },
+    "required": ["people", "pii"],
+}
+
+# Second opinion per candidate sentence: the detector lists too much (a lost key, a cake order), and quotes whole
+# messages; each sentence it flagged is checked on its own, and only confirmed ones are redacted.
+_CHECK_SYSTEM = """You decide whether ONE sentence must be hidden before a chat or text is shown to an outside AI assistant. Hide only intimate or very personal matters%(what)s, about the writer or anyone else. Answer with JSON only: {"category": "<category>"}.
+Hide:
+- health: an illness, diagnosis, injury, symptoms, medication, treatment, surgery, pregnancy, medical test results
+- mental_health: depression, anxiety, panic attacks, burnout, therapy, psychiatrist, self-harm, addiction
+- sexual: sex, sexual orientation, intimate body details
+- dating: a date, crush, hookup, dating app, who is seeing or sleeping with whom
+- relationship: a breakup, cheating, a couple's fight, divorce, jealousy
+- family: a conflict within a family, a family member's private problems
+- %(money)s%(business)s
+- confidential: a personal secret told in confidence
+- gossip: crude or mean personal gossip about someone's looks, drinking, sex life or private life
+Keep ("none"): everything else, which is most sentences: %(keep)s, presents, cakes, food, photos, lost or broken things, surprise parties and the excuses for them, work and school logistics, exams, appointments without medical details, looking for a doctor or dentist, being tired or hungover, sports, weather, jokes, emojis, everyday moods.
+Judge only the given sentence. The message around it is context only: a sentence about plans, attendance or anything harmless is "none" even if another sentence of the same message is private.
+Examples:
+"Mis Velo isch scho wieder kaputt 😤" -> none
+"so hungover today, never again" -> none
+"Ich muss noch einen Coiffeur-Termin abmachen" -> none
+"Du schuldsch mir no 12.- vom Kino" -> none
+"Mir säged ihm eifach, mir gönd go esse, damit er nüt merkt" -> none
+"Poste nie meh dini IBAN i d'Gruppe 😂" -> none
+"Am Sunntig chumi aber gliich!" (after a sentence about having the flu) -> none
+"De Hausarzt het mer Antibiotika verschribe wäge de Lungenentzündig" -> health
+"I've been on antidepressants since spring" -> mental_health
+"Mir händ eus trennt, si het e Neue" -> relationship
+"Er hat 20'000 Schulden und kann die Miete nicht mehr zahlen" -> money
+"we hooked up after the club last night" -> dating%(examples)s"""
+_CHECK_EXAMPLES_V3 = """
+"Ich tuen jede Monet 2000 is Depot und chauf no meh Bitcoin" -> money
+"They offered me 135k plus bonus for the new job" -> money
+"Han mer jetzt doch de Occasion-Tesla für 38'000 gönnt" -> money
+"Mir händ de Uftrag vo de Bäckerei Frei für 6000 Stutz becho" -> business
+"Das Zugticket nach Bern kostet 25.-, ich buche für uns beide" -> none
+"Deine Krankenkassenrechnung ist bis Ende Monat fällig" -> none"""
+CHECK_SYSTEM = _CHECK_SYSTEM % {
+    "what": ", or someone's money or business details", "money": _MONEY_V3, "business": "\n- " + _BUSINESS_V3,
+    "keep": ("plans, invitations, meeting points, dates and times, places, trips, events, bills and their due dates, "
+             "collecting money for a gift, splitting small everyday costs (pizza, drinks, tickets) and the small amounts "
+             "friends owe each other for them, TWINT or bank transfers for those, credit cards and account numbers (they "
+             "are masked separately)"),
+    "examples": _CHECK_EXAMPLES_V3}
+CHECK_SYSTEM_ADMIN = _CHECK_SYSTEM % {
+    "what": "", "money": "money: someone's debts, money problems, debt collection, being unable to pay rent or bills",
+    "business": "",
+    "keep": ("plans, invitations, meeting points, dates and times, places, prices, collecting money for a gift, splitting "
+             "costs, small amounts friends owe each other, payments, TWINT, bank transfers, credit cards and account "
+             "numbers (they are masked separately)"),
+    "examples": ""}
+
+
+def check_schema(categories):
+    return {"type": "object", "properties": {"category": {"type": "string", "enum": categories + ["none"]}},
+            "required": ["category"]}
+
+
+CHECK_SCHEMA = check_schema(PRIVATE_CATEGORIES)
+CHECK_SCHEMA_ADMIN = check_schema(ADMIN_CATEGORIES)
+
+_SUMMARY_RULES = """Be as detailed as possible: cover every topic, plan, decision, date, time, place, %(amount)sopen question and action item (especially what You agreed to do or were asked), and who said or decided what. Keep nuance and tone where it matters. When a plan or answer changes during the chat, report the final state (and mention the change). Give calendar dates only as they are written in the text; do not convert weekdays into dates yourself. Do not invent anything. Write in English, as bullet points grouped by topic."""
+_SUMMARY_MONEY = """
+Money and business stay private: never state anyone's salary, income, savings, investments, portfolio, trades, debts, bigger purchases and their prices, or business deals and their figures, even if some of it is still in the text; at most say that someone shared something private (money) or (business). Small everyday costs (a gift share, tickets, a pizza) and bills with their due dates may be mentioned."""
+_SUMMARY_PLACEHOLDERS = """Placeholders in brackets mark content removed on purpose: "[private: <category>]" is an intimate or personal passage (money and business included), and [phone], [email], [IBAN], [amount], [secret], [surname], [link: ...] and the like are identifiers."""
+SUMMARY_SYSTEM = """You write a detailed summary of a chat or text for its owner. "You" is the owner; other people appear with their real names. """ + _SUMMARY_PLACEHOLDERS + """ Never guess or reconstruct removed content; at most say that someone shared something private (e.g. "Lena shared something private (health)").
+""" + _SUMMARY_RULES % {"amount": ""} + _SUMMARY_MONEY
+SUMMARY_SYSTEM_STRICT = """You write a detailed summary of an anonymized chat or text for its owner. "You" is the owner. Other people appear only as aliases (Person A, Person B, ...): use exactly these aliases and never guess real names. Placeholders in brackets such as [phone], [address], [amount] or [link: ...] mark removed personal data, and "[private: <category>]" marks a removed intimate or personal passage (money and business included): do not try to reconstruct them; at most say that someone shared something private.
+""" + _SUMMARY_RULES % {"amount": ""} + _SUMMARY_MONEY
+SUMMARY_SYSTEM_ADMIN = """You write a detailed summary of a chat or text for its owner. "You" is the owner; other people appear with their real names. Placeholders in brackets mark content removed on purpose: "[private: <category>]" is an intimate or personal passage, and [phone], [email], [IBAN], [secret], [surname], [link: ...] and the like are identifiers. Never guess or reconstruct removed content; at most say that someone shared something private (e.g. "Lena shared something private (health)").
+""" + _SUMMARY_RULES % {"amount": "amount, "}
+
+PLACEHOLDER = {"phone": "[phone]", "email": "[email]", "address": "[address]", "iban": "[IBAN]",
+               "card": "[card number]", "ahv": "[AHV number]", "id": "[ID number]", "birthdate": "[birthdate]",
+               "location": "[location]", "plate": "[license plate]", "link": "[link]", "secret": "[secret]"}
+TITLES = {"herr", "herrn", "frau", "dr", "dr.", "prof", "prof.", "mr", "mr.", "mrs", "mrs.", "ms", "ms.", "fräulein"}
+NOT_NAMES = {"mama", "papa", "mami", "papi", "mom", "dad", "mum", "chef", "boss", "bro", "you", "person", "ich",
+             "du", "wir", "ihr", "me", "us", "team", "alle", "everyone"}
+CHAT_PREFIX = [
+    re.compile(r"^\s*\[[^\]\n]{4,40}\]\s*([^:\n\[\]]{1,40}?):\s"),                       # [2026-10-11 09:12] Name: text
+    re.compile(r"^\s*\d{1,2}[./]\d{1,2}[./]\d{2,4},?\s+\d{1,2}:\d{2}(?::\d{2})?\s*[-–]\s*([^:\n]{1,40}?):\s"),  # WhatsApp
+]
+WORD = r"[^\W_]"   # a letter or digit
+# First names that are also everyday words: matched only capitalised ("I will come" must not become "I Person C come").
+COMMON_WORD_NAMES = {"will", "may", "june", "april", "august", "mark", "bill", "grace", "hope", "joy", "rose", "art",
+                     "pat", "sue", "ray", "dawn", "faith", "sky", "summer", "rich", "chance", "frank", "jack", "max",
+                     "jo", "ben", "don", "eve", "ivy", "lily", "page", "rob", "mai", "ida", "hans", "ehre", "kim",
+                     "sonne", "rosa", "linda", "paris", "china", "india", "jordan", "chase", "hunter", "major"}
+
+
+CUT_EVERY = 32                                   # a line is a cut point when its hash % CUT_EVERY == 0 (~every 32 lines)
+
+
+def cut_line(line):
+    return int(hashlib.sha256(line.encode("utf-8", "replace")).hexdigest()[:8], 16) % CUT_EVERY == 0
+
+
+def chunk_lines(text, max_chars):
+    """Line-aligned chunks of at most max_chars, cut where the content says, so the same
+    messages give the same chunks when the window around them moves (recent -n 30 plus one new message: only the
+    first and the last chunk change). A cut point (cut_line) ends a chunk when the text since the previous cut point
+    holds at least max_chars // 6 characters: a choice that depends on those lines only, never on where the window
+    starts. A chunk that would grow past max_chars ends at its last unused cut point, else before the line."""
+    chunks, cur, seg, soft = [], "", 0, 0           # seg: chars since the last cut point; soft: an unused one in cur
+    small = max_chars // 6
+    for line in text.splitlines(keepends=True):
+        while len(line) > max_chars:                      # very long line: hard split
+            if cur:
+                chunks.append(cur); cur = ""
+            chunks.append(line[:max_chars]); line = line[max_chars:]
+            soft = 0
+        if cur and len(cur) + len(line) > max_chars:
+            if soft and len(cur) - soft + len(line) <= max_chars:
+                chunks.append(cur[:soft]); cur = cur[soft:]
+            else:
+                chunks.append(cur); cur = ""
+            soft = 0
+        cur += line
+        seg += len(line)
+        if cut_line(line):
+            if seg >= small:
+                chunks.append(cur); cur = ""; soft = 0
+            else:
+                soft = len(cur)
+            seg = 0
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def name_tokens(name):
+    toks = [t for t in re.split(r"\s+", name.strip().lstrip("@")) if t]
+    titled = bool(toks) and toks[0].lower() in TITLES
+    toks = [t.strip(".,;:()") for t in toks if t.lower() not in TITLES]
+    return [t for t in toks if len(t) >= 2], titled
+
+
+class People:
+    """Alias map: private people -> Person A, B, ...; the owner -> You. Consistent across chunks."""
+
+    def __init__(self, owner=None):
+        self.persons = []          # {"alias", "names": [display forms]}
+        self.n = 0
+        if owner:
+            self.persons.append({"alias": "You", "names": [owner]})
+
+    @staticmethod
+    def _norm(s):
+        return " ".join(name_tokens(s)[0]).lower()
+
+    def find(self, names):
+        normed = {self._norm(n) for n in names if self._norm(n)}
+        for p in self.persons:                                   # exact (full-form) match first
+            if normed & {self._norm(n) for n in p["names"]}:
+                return p
+        singles = {n for n in normed if " " not in n}
+        for p in self.persons:                                   # first name or surname alone
+            for n in p["names"]:
+                toks = self._norm(n).split()
+                if len(toks) > 1 and singles & {toks[0], toks[-1]}:
+                    return p
+            # a full name whose first/last token is a known single-token name
+            pn = {self._norm(n) for n in p["names"] if " " not in self._norm(n)}
+            for n in normed:
+                t = n.split()
+                if len(t) > 1 and pn & {t[0], t[-1]}:
+                    return p
+        return None
+
+    def add(self, name, variants=()):
+        names = [n.strip() for n in [name, *variants] if n and n.strip()]
+        names = [n for n in names if name_tokens(n)[0] and self._norm(n) not in NOT_NAMES]
+        if not names:
+            return None
+        p = self.find(names)
+        if p is None:
+            p = {"alias": "Person " + self._label(self.n), "names": []}
+            self.n += 1
+            self.persons.append(p)
+        for n in names:
+            if n not in p["names"]:
+                p["names"].append(n)
+        return p
+
+    @staticmethod
+    def _label(i):
+        letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        return letters[i] if i < 26 else letters[i % 26] + str(i // 26 + 1)
+
+    def known(self):
+        return "; ".join("%s (also: %s)" % (p["names"][0], ", ".join(p["names"][1:])) if len(p["names"]) > 1
+                         else p["names"][0] for p in self.persons)
+
+    def patterns(self):
+        """[(regex, alias)] longest first. Full names and first names match case-insensitively; surnames
+        (last token of a full name, or a name used with a title) only as capitalised, since many German
+        surnames are ordinary words (frei, Keller, weber)."""
+        items = []
+        for p in self.persons:
+            parsed = [name_tokens(n) for n in p["names"]]
+            surnames = {t[-1].lower() for t, titled in parsed if t and (titled or len(t) > 1)} | COMMON_WORD_NAMES
+            for toks, titled in parsed:
+                if not toks:
+                    continue
+                if len(toks) > 1:
+                    items.append((r"\s+".join(map(re.escape, toks)), True, p["alias"]))
+                    items.append((re.escape(toks[0]), toks[0].lower() not in surnames, p["alias"]))
+                    items.append((re.escape(toks[-1]), False, p["alias"]))
+                else:
+                    items.append((re.escape(toks[0]), toks[0].lower() not in surnames, p["alias"]))
+        seen, out = set(), []
+        for pat, ci, alias in sorted(items, key=lambda x: -len(x[0])):
+            if (pat.lower(), ci) in seen:
+                continue
+            seen.add((pat.lower(), ci))
+            rx = re.compile(r"(?<!%s)@?(%s)('s|’s|s)?(?!%s)" % (WORD, pat, WORD), re.I if ci else 0)
+            out.append((rx, alias))
+        return out
+
+
+def apply_people(text, people):
+    for rx, alias in people.patterns():
+        def rep(m, alias=alias):
+            at = "@" if m.group(0).startswith("@") else ""
+            return at + alias + ("'s" if m.group(2) else "")
+        text = rx.sub(rep, text)
+    return text
+
+
+_DAYS = (r"montag|dienstag|mittwoch|donnerstag|freitag|samstag|sonntag|mäntig|zischtig|mittwuch|dunschtig|friitig|"
+         r"samstig|sunntig|monday|tuesday|wednesday|thursday|friday|saturday|sunday|heute|morgen|hüt|today|tomorrow|"
+         r"abig|abend|evening|morning|januar|februar|märz|april|mai|juni|juli|august|september|oktober|november|"
+         r"dezember|january|february|march|may|june|july|october|december")
+TIME_OR_AMOUNT = re.compile(r"(?i)^(?:\d{1,2}[:.h]\d{2}(?:\s?uhr)?|(?:chf|fr\.?|eur|€|\$)?\s?\d{1,3}(?:['’ ]?\d{3})*"
+                            r"(?:[.,]\d{1,2}|\.-|\.–)?\s?(?:chf|fr\.?|eur|€|-)?)$")
+DATE_NO_YEAR = re.compile(r"^\d{1,2}\.\s?(?:\d{1,2}\.?)?(?:\s?[–-]\s?\d{1,2}\.(?:\d{1,2}\.?)?)?$")
+DAY_WORDS = re.compile(r"(?i)^(?:am\s+|on\s+|bis\s+|until\s+|next\s+)?(?:" + _DAYS + r")\b(?:\s+(?:" + _DAYS + r"))?[\s\d.,:/–-]*$")
+STREET = re.compile(r"(?i)strasse|straße|str\.|gasse|weg\b|platz|allee|ring\b|quai|street|road|avenue|lane|rue|via|chemin")
+HOME_WORK_CUE = re.compile(r"(?i)\b(?:wohn(?:e|t|en|sch|ung|ort)?|dihei|daheim|zuhause|zu hause|home|live[sd]?|living|"
+                           r"büro|office|arbeite[nt]?|schaffe|schafft|work(?:s|ing)?\s+(?:at|in|for|bei)|job\s+(?:at|bei))\b")
+
+
+def plausible(typ, t):
+    """Only PII-shaped spans are replaced: a small model sometimes flags times, weekdays or amounts, and a
+    global replacement would then wipe real facts."""
+    digits = sum(c.isdigit() for c in t)
+    if typ == "secret":            # PINs and codes are often bare digits, so no amount guard; times/dates/days stay
+        return (len(t) >= 4 and not re.match(r"^\d{1,2}[:.h]\d{2}(?:\s?uhr)?$", t, re.I) and not DATE_NO_YEAR.match(t)
+                and not DAY_WORDS.match(t) and not re.search(r"(?i)chf|\bfr\.|eur\b|€|\$|\.-|\.–", t))
+    if len(t) < 3 or TIME_OR_AMOUNT.match(t) or DATE_NO_YEAR.match(t) or DAY_WORDS.match(t):
+        return False
+    if typ == "birthdate":
+        return bool(re.search(r"\b(19|20)\d{2}\b|\b\d{1,2}[./]\d{1,2}[./]\d{2}\b", t))
+    if typ == "address":
+        return bool(re.search(r"[^\W\d_]", t)) and (bool(STREET.search(t)) or bool(re.search(r"\b\d{4}\s+[^\W\d_]", t)))
+    if typ == "link":
+        return bool(re.match(r"(?i)(https?://|www\.|t\.me/)", t))
+    if typ in ("phone", "iban", "card", "ahv"):
+        return digits >= 7
+    if typ == "email":
+        return "@" in t
+    if typ == "plate":
+        return digits >= 1 and bool(re.search(r"[A-Za-z]", t))
+    if typ == "id":
+        return digits >= 4 or (len(t) >= 6 and digits >= 2 and re.search(r"[A-Za-z]", t) is not None)
+    if typ == "location":
+        return len(t.split()) >= 2
+    return False
+
+
+def apply_spans(text, spans):
+    """Replace model-reported PII spans (verbatim, whitespace-tolerant) that pass plausible(). A 'location'
+    is only replaced where a home/work cue word (wohnt, dihei, office, schaffe...) is close before it."""
+    items = []
+    for s in spans:
+        t, typ = (s.get("text") or "").strip(), s.get("type")
+        if typ in PLACEHOLDER and plausible(typ, t):
+            items.append((t, typ))
+    for t, typ in sorted(set(items), key=lambda x: -len(x[0])):
+        ph = link_placeholder(t) if typ == "link" else PLACEHOLDER[typ]
+        rx = re.compile(r"(?<!%s)%s(?!%s)" % (WORD, r"\s+".join(map(re.escape, t.split())), WORD))
+        if typ == "location":
+            def cue(m, ph=ph):
+                start = max(m.string.rfind("\n", 0, m.start()) + 1, m.start() - 60)   # same line, 60 chars back
+                return ph if HOME_WORK_CUE.search(m.string[start:m.start()]) else m.group(0)
+            text = rx.sub(cue, text)
+        else:
+            text = rx.sub(lambda m, ph=ph: ph, text)
+    return text
+
+
+def link_placeholder(url):
+    m = re.match(r"(?i)(?:https?://)?(?:www\.)?([^/\s?#]+)", url)
+    return "[link: %s]" % m.group(1).lower() if m else "[link]"
+
+
+# Regex safety pass (after the model): order matters (emails before @handles, URLs before digit runs).
+RX_EMAIL = re.compile(r"[\w.+%-]+@[\w-]+(?:\.[\w-]+)+")
+RX_URL = re.compile(r"(?i)\b(?:https?://|www\.)[^\s<>\"')\]]+")
+RX_IBAN = re.compile(r"\b[A-Z]{2}\d{2}(?:[ ]?[A-Z0-9]){11,30}\b")
+RX_AHV = re.compile(r"(?<!\d)756[.\s]?\d{4}[.\s]?\d{4}[.\s]?\d{2}(?!\d)")
+RX_CARD = re.compile(r"(?<![\d.])\d(?:[ -]?\d){12,18}(?![\d])")
+# the country code may stand in brackets: "(+41) 79 123 45 67", "(0041) 791234567"
+RX_PHONE_INTL = re.compile(r"(?<![\w+])(?:\(\s?(?:\+|00)[1-9]\d{0,2}\s?\)|(?:\+|00)[1-9]\d{0,2})[ .\-/]?(?:\(0\)[ .\-/]?)?"
+                           r"\d{1,4}(?:[ .\-/]?\d{2,4}){2,4}(?!\d)")
+RX_PHONE_NAT = re.compile(r"(?<![\w.:/])0\d{2}[ .\-/]?\d{3}[ .\-/]?\d{2}[ .\-/]?\d{2}(?![\d:])|(?<![\w.:/])0\d{2,4}[ /\-]?\d{6,8}(?![\d:])")
+RX_PLATE = re.compile(r"\b(?:AG|AI|AR|BE|BL|BS|FR|GE|GL|GR|JU|LU|NE|NW|OW|SG|SH|SO|SZ|TG|TI|UR|VD|VS|ZG|ZH)"
+                      r"[ ]?(?:\d{1,3}[ ']\d{3}|\d{3,6})\b")
+# A full date with year next to a birth keyword ("geboren am 18.10.1996", "am 18.10.1996 gebore", "DOB 1996-10-18").
+_DATE = r"(\d{1,2}\.\s?\d{1,2}\.\s?(?:19|20)\d{2}|\d{1,2}/\d{1,2}/(?:19|20)\d{2}|(?:19|20)\d{2}-\d{2}-\d{2})"
+_BIRTH = r"(?:geb(?:oren|ore|\.)|born|birth\s?date|date of birth|dob|geburtsdatum|geburtstag|jahrgang)"
+RX_BIRTH_AFTER = re.compile(r"(?i)(" + _BIRTH + r"\W{0,3}(?:am|on|:)?\s{0,3})" + _DATE)
+RX_BIRTH_BEFORE = re.compile(r"(?i)" + _DATE + r"(\s{1,3}(?:\w+\s{1,3}){0,2}" + _BIRTH + r")")
+RX_HANDLE = re.compile(r"(?<![\w.@])@(?!You\b|Person\b)[A-Za-z][A-Za-z0-9_]{3,31}\b")
+# Passwords, PINs, codes: keyword (also in compounds: Türcode, WLAN-Passwort) + ':'/'='/'is(t|ch)'/'lautet' + value.
+RX_SECRET = re.compile(r"(?i)\b((?!dress|bar|qr|post|zip|source|promo|area|country)[a-zäöüß-]*?"
+                       r"(?:passw(?:or)?[dt]|kennwort|passcode|code|pin|puk)|pw|pwd|otp|tan"
+                       r"|wlan[- ]?(?:pw|key|schlüssel)|wi-?fi[- ]?(?:pw|key|password))"
+                       r"(\s*(?:[:=]|\b(?:ist|is|isch|lautet|wäre|was|war)\b)\s*|\s+)"
+                       r"((?:(?:übrigens|uebrigens|also|jetzt|neu|nur|immer|no|noch|still|now|btw|again|by the way|"
+                       r"ab jetzt|from now on|wieder)\b,?\s+){0,3})([^\s,;]+)")
+RX_ACCOUNT = re.compile(r"(?i)\b(konto(?:nummer|-?nr\.?)?|kto\.?(?:-?nr\.?)?|account(?:\s+(?:number|no\.?|nr\.?))?"
+                        r"|postkonto|pc-konto|bankverbindung|clearing(?:-?nr\.?)?)(\s*[:#]?\s*)([0-9][0-9 .\-/]{3,30}[0-9])")
+RX_POSTAL_ACCOUNT = re.compile(r"(?<![\d-])\d{2}-\d{3,6}-\d(?![\d-])")
+
+# Money net (policy v3; v3.1: payment words, amount labels, --all-amounts for mail):
+# amounts -> [amount] when the model missed a money/business passage.
+# - Chats (default): a currency amount from MONEY_MIN up always goes; any amount (also a bare number from 100 up, with
+#   cents, or with k/Mio) goes when a money/business/payment word is on the same line within MONEY_WINDOW characters;
+#   a number right after an amount label (RX_LABEL: "Total:", "Betrag", "Rechnungsbetrag", "amount due", ...) goes
+#   when it has a currency, cents, k/Mio or is from 100 up.
+# - all_amounts (--all-amounts, the owner's own mail: receipts, orders, bank notices): every
+#   currency amount of any size, every number right after an amount label, and bare cents that can't be a time.
+# Dates, times ("um 19.30"), years, percentages, tgread refs (#123), chat ids and URL parameters stay. In chats, small
+# everyday costs without such a word (35.- pro Person) and a bill's amount next to its due date stay.
+# Mail (an address and phone must never become "Examplestrasse 1, [amount] Exampletown ... (+41) [amount]"): the money-word rule
+# for BARE numbers is for chats only; in mail a number is an amount only with a currency, an amount label, cents, or a
+# k/Mio suffix next to a money word. In both modes a postcode before a place ("1234 Exampletown", "CH-1234 Exampletown")
+# and a phone-like number (after "+41", "(+41)", "Tel", or 9+ digits in a row) are never amounts.
+MONEY_MIN = 5000
+MONEY_WINDOW = 120
+# Swiss German amounts ("12'000 Franke Schulde bi de Bank"): Swiss German currency words (Franke,
+# Fränkli, Stutz, Chlotz, Rappe, "Fr" without a dot), currency words in any case ("chf 500"), more thousands separators
+# (12’000, 12´000, 12 000 with a no-break/thin space; a plain space only next to a currency: "CHF 12 000", "12 000
+# Franke"), "Tausend"/"tuusig"/"Mille"/"grand" as multipliers, debt nouns as money words ("Schulde", "Betreibig"), and
+# amounts written in words next to a currency or a money word ("zwölftausend Franke", "twelve thousand dollars").
+_TS = "'’‘´ʼ"                                    # Swiss thousands separators: 12'000, 12’000, 12´000
+_TSP = "   "                      # no-break, narrow no-break and thin space as thousands separators
+_CUR_PRE = r"(?i:CHF|SFr\.?|Fr\.|EUR|€|USD|US\$|\$|£|GBP)"
+_CUR_POST = (r"(?i:CHF|SFr\.?|Fr\.?(?!\s?\d)|Franken|Franke|Frankä|Fränkli|Fränkle|Frankli|Rappen?|Räppli|Stutz|Stütz|"
+             r"Stutzli|Stützli|Chlotz|Chlötz|Chlötzli|EUR|Euros?|€|USD|Dollars?|\$|£|GBP|Pfund|bucks|francs?)"
+             r"(?![^\W\d_])")
+_SUF = (r"(?i:k|Tsd\.?|tausend|tuusig|tusig|tausig|Mille|Mio\.?|Millionen|millions?|Mia\.?|Mrd\.?|Milliarden?|bn|"
+        r"billions?|grand)(?![^\W\d_])")
+_MULT = {"k": 1e3, "tsd": 1e3, "tausend": 1e3, "tuusig": 1e3, "tusig": 1e3, "tausig": 1e3, "mille": 1e3, "grand": 1e3,
+         "mio": 1e6, "million": 1e6, "millionen": 1e6, "millions": 1e6,
+         "mia": 1e9, "mrd": 1e9, "milliarde": 1e9, "milliarden": 1e9, "bn": 1e9, "billion": 1e9, "billions": 1e9}
+RX_AMOUNT = re.compile(
+    r"(?<![\w.,/:#=&?+" + _TS + r"-])"
+    r"(?:(?P<pre>" + _CUR_PRE + r")\s?)?"
+    r"(?P<num>\d{1,3}(?:[" + _TS + _TSP + r"]\d{3})+(?:[.,]\d{1,2})?"
+    r"|(?(pre)\d{1,3}(?: \d{3})+(?:[.,]\d{1,2})?(?![\d" + _TS + r"])|(?!))"            # CHF 12 000
+    r"|\d{1,3}(?: \d{3})+(?:[.,]\d{1,2})?(?=\s?(?:" + _CUR_POST + r"|\.[-–]))"         # 12 000 Franke
+    r"|\d{1,3}(?:[.,]\d{3})+(?![.,]?\d)|\d+(?:[.,]\d{1,2})?)"
+    r"(?:\s?(?P<suf>" + _SUF + r"))?"
+    r"(?:(?P<dash>\.[-–])|\s?(?P<post>" + _CUR_POST + r"))?"
+    r"(?![^\W_]|[" + _TS + r"]\d)")
+# amounts in words: a number word with a magnitude (zwölftausend, füfzähtuusig, zwei Millionen, e Million, twelve
+# thousand, a million, five grand); masked next to a currency word or a money word (not "hundert Prozent", "tausend Lüt")
+_NUM_MORPH = (r"(?:eins|eine|ein|zwei|zwöi|drei|drü|vier|fünf|föif|füf|sechs|sächs|säch|sech|sieben|sieb|sibe|acht|ach|"
+              r"neun|nün|zehn|zäh|elf|zwölf|zwanzig|zwänzg|dreissig|dreißig|drissg|zig|ßig|ssig|zg|und|e|hundert|"
+              r"tausend|tuusig|tusig|tausig)")
+_EN_NUM = (r"(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|"
+           r"seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred)")
+RX_WORD_AMOUNT = re.compile(
+    r"(?i)(?<![^\W\d_])(?:"
+    r"(?=[^\W\d_]*(?:hundert|tausend|tuusig|tusig|tausig))" + _NUM_MORPH + r"+"
+    r"|(?:" + _NUM_MORPH + r"+|en|ei|eis|a|an)[\s-]+(?:millionen|million|mio\.?|milliarden?|mia\.?|mrd\.?|mille|tausend|"
+    r"tuusig)"
+    r"|(?:" + _EN_NUM + r"|a|an)(?:[\s-]+(?:" + _EN_NUM + r"|and))*[\s-]+(?:hundred|thousand|million|billion|grand)s?"
+    r")(?![^\W\d_])"
+    r"(?!\s*(?:prozent|%|percent|pro|mal|times|jahre?|years?|meter|km|kilo\w*|kg|leute|lüt|people|personen|gäst\w*|"
+    r"guests?|mitglieder|members?|follower\w*|views|likes|stück|stk)(?![^\W\d_]))"
+    r"(?:\s?(?P<post>" + _CUR_POST + r"))?")
+MONEY_CUE = re.compile(
+    r"(?i)(?<![^\W\d_])(?:invest\w*|invesch\w*|aktie\w*|stocks?|shares|etfs?|fonds|funds?|depot\w*|portfolio\w*|"
+    r"portefeuille|krypto\w*|crypto\w*|bitcoin|btc|ethereum|trading|trades?|traded|tranche\w*|rendite\w*|dividend\w*|"
+    r"zinsen|hypothek\w*|mortgage|kredit|darlehen|loan|schulden|schulde|schuldä|schuldenberg\w*|schuldenfalle|"
+    r"verschuld\w*|betreibung\w*|betreibig\w*|pfändung\w*|gepfändet|konkurs\w*|bankrupt\w*|pleite|pleiti|debts?|"
+    r"indebted|gspart|gespart|geerbt|erbschaft\w*|inherit\w*|"
+    r"lohn|löhne|lohnerhöhung|"
+    r"gehalt|gehälter|salär|salary|salaries|wages?|bonus|einkommen|income|verdien\w*|earn(?:s|ed|ing)?|vermögen|"
+    r"wealth|erspart\w*|ersparnis\w*|savings|sparkonto|sparplan|kontostand|säule\s?3a|3a|pensionskasse|umsatz|"
+    r"revenue|turnover|gewinn\w*|profit\w*|verlust\w*|marge|margin|provision|commission|deals|deal\s+(?:mit|with)|geschäft\w*|"
+    r"business|firma|company|startup|offerte\w*|verhandl\w*|negotiat\w*|kaufpreis|kauf|kaufe|kauft|gekauft|"
+    r"chauf|chaufe|chauft|verkauf\w*|bought|buying|purchas\w*|bulk|resell\w*|wiederverkauf\w*|steuern|"
+    r"steuerrechnung|taxes|"
+    # v3.1: payment acts and receipts ("paid $108.34", "per TWINT überwiesen", "hat mich 120.- gekostet")
+    r"paid|pay(?:s|ing)?|payments?|bezahl\w*|(?:ein|aus|zurück|ab|an|nach|vor)?zahl(?:e|en|st|t|te|ten|ed|sch|ung\w*|bar)|"
+    r"überw[ie]+s\w*|abgebucht|belast(?:et|ung\w*)|gutschrift\w*|refund\w*|rückerstatt\w*|erstattet|charged|billed|"
+    r"receipts?|quittung\w*|twint|spent|ausgegeben|gekostet)(?![^\W\d_])")
+# Amount labels right before a number (v3.1). strong: a label in chats too; sep: in chats only with ':' or '='
+# ("Total: 45.00", but not "kostet total 1450.-"); weak (prices, fees, taxes): only with --all-amounts.
+RX_LABEL = re.compile(
+    r"(?i)(?<![^\W\d_])(?:(?P<strong>(?:grand\s+|order\s+|sub-?)total|amount\s+(?:due|paid|charged|payable)|"
+    r"balance\s+due|you\s+paid|charged|refund(?:ed)?|[^\W\d_]*betrag|[^\W\d_]*summe|zu\s+(?:be)?zahlen|abgebucht|"
+    r"belastet|gutschrift|saldo|montant|importo)"
+    r"|(?P<sepreq>total|totale|amount|balance|paid|payment|zahlung|überweisung|bezahlt)"
+    r"|(?P<weak>price|prix|[^\W\d_]*preis|costs?|[^\W\d_]*kosten|fees?|[^\W\d_]*gebühr(?:en)?|tax|vat|mwst|tip))"
+    r"\s*(?:\([^()\n]{0,40}\)\s*)?(?P<sep>[:=])?\s*$")
+_DAY, _MON = r"(?:0?[1-9]|[12]\d|3[01])", r"(?:0?[1-9]|1[0-2])"
+MONEY_KEEP = re.compile(
+    r"(?<!\d)" + _DAY + r"\.\s?" + _MON + r"\.(?:\s?(?:19|20)?\d{2}(?!\d))?"          # 18.10. / 18.10.2026
+    r"|(?<!\d)" + _DAY + r"\.\s?[–-]\s?" + _DAY + r"\."                                  # 16.–18.
+    r"|(?<!\d)\d{1,2}[:.]\d{2}\s?(?:uhr|h)\b|(?<!\d)\d{1,2}:\d{2}(?!\d)"              # 19.00 Uhr, 14:00
+    r"|\b(?:19|20)\d{2}-\d{2}-\d{2}\b|\bS&P\s?500\b|\d+(?:[.,]\d+)?\s?%"
+    r"|\b(?:um|ab|bis|gegen|at|from|until|till)\s+(?:[01]?\d|2[0-3])[.:][0-5]\d(?!\d)", re.I)  # um 19.30
+
+
+POSTCODE_BEFORE = re.compile(r"(?i)(?:^|[,;(]\s*|\b(?:CH|FL|D|A|F|I)\s?-\s?|\b(?:plz|zip|postcode|postal\s+code)\s*:?\s*|"
+                             r"\b(?:in|an|nach|to|at|bei|von|aus|ab)\s+)$")
+POSTCODE_AFTER = re.compile(r"\s+[A-ZÄÖÜ][a-zäöüéèàç]{2,}")
+PHONE_BEFORE = re.compile(r"(?i)(?:\(\s?(?:\+|00)\d{1,3}\s?\)|(?<![\w+])(?:\+|00)\d{1,3}|\b(?:tel|telefon|phone|natel|"
+                          r"mobile?|handy|fon|whatsapp)\b\.?\s*:?)[\s\d().\-/]*$")
+
+
+def not_an_amount(text, s, e, bare, ls):
+    """A postcode before a place name or a phone-like number: never [amount]."""
+    if re.fullmatch(r"[1-9]\d{3,4}", bare):
+        after = POSTCODE_AFTER.match(text, e)
+        if after and POSTCODE_BEFORE.search(text, max(ls, s - 16), s) \
+                and not MONEY_CUE.match(text, after.start() + len(after.group(0)) - len(after.group(0).lstrip()),
+                                        after.end()):
+            return True
+    if re.fullmatch(r"\d{9,}", bare):
+        return True
+    return PHONE_BEFORE.search(text, max(ls, s - 30), s) is not None
+
+
+def amount_value(m):
+    num = re.sub("[ " + _TS + _TSP + "]", "", m.group("num"))
+    if re.fullmatch(r"\d{1,3}(?:[.,]\d{3})+", num):
+        num = re.sub(r"[.,]", "", num)
+    try:
+        v = float(num.replace(",", "."))
+    except ValueError:
+        return 0.0
+    suf = (m.group("suf") or "").lower().rstrip(".")
+    return v * _MULT.get(suf, 1)
+
+
+def _maybe_time(num):
+    t = re.fullmatch(r"(\d{1,2})[.:](\d{2})", num)
+    return bool(t) and int(t.group(1)) <= 23 and int(t.group(2)) <= 59
+
+
+def money_pass(text, all_amounts=False):
+    """-> (text with money amounts -> [amount], hits). See MONEY_MIN / MONEY_CUE / RX_LABEL above. all_amounts: the
+    owner's own mail (--all-amounts): every currency amount and labelled number, and bare cents that can't be a time."""
+    keep = [(k.start(), k.end()) for k in MONEY_KEEP.finditer(text)]
+    hits = [0]
+
+    def repl(m):
+        s, e = m.span()
+        if any(s < ke and ks < e for ks, ke in keep):
+            return m.group(0)
+        cur = bool(m.group("pre") or m.group("post") or m.group("dash"))
+        v = amount_value(m)
+        bare, suf = m.group("num"), m.group("suf")
+        cents = bool(re.search(r"[.,]\d{2}$", bare)) and not re.fullmatch(r"\d{1,3}(?:[.,]\d{3})+", bare)
+        year = not (cur or suf or cents) and bool(re.fullmatch(r"(?:19|20)\d{2}", bare))
+        ls = text.rfind("\n", 0, s) + 1
+        le = text.find("\n", e)
+        le = len(text) if le < 0 else le
+        lab = RX_LABEL.search(text, max(ls, s - 60), s)
+        amountish = cur or suf or cents or (v >= 100 and not year)
+        if not (cur or lab) and not_an_amount(text, s, e, bare, ls):
+            return m.group(0)                                    # a postcode or a phone number (v3.1 fix)
+        if all_amounts:
+            if (cur or lab) and not year:
+                hits[0] += 1
+                return "[amount]"
+            if cents and not _maybe_time(bare):
+                hits[0] += 1
+                return "[amount]"
+            if not suf:
+                return m.group(0)                                # mail: a bare number near a money word is no amount
+        elif cur and v >= MONEY_MIN:
+            hits[0] += 1
+            return "[amount]"
+        elif lab and (lab.group("strong") or (lab.group("sepreq") and lab.group("sep"))) and amountish:
+            hits[0] += 1
+            return "[amount]"
+        if not MONEY_CUE.search(text, max(ls, s - MONEY_WINDOW), min(le, e + MONEY_WINDOW)):
+            return m.group(0)
+        if not amountish:
+            return m.group(0)
+        if cents and not (cur or suf) and _maybe_time(bare):
+            return m.group(0)                                    # "bezahlt, Treffpunkt 19.30": a time
+        hits[0] += 1
+        return "[amount]"
+    text = RX_AMOUNT.sub(repl, text)
+
+    def wrepl(m):                                                # amounts in words
+        s, e = m.span()
+        ls = text.rfind("\n", 0, s) + 1
+        le = text.find("\n", e)
+        le = len(text) if le < 0 else le
+        if m.group("post") or (not all_amounts and MONEY_CUE.search(text, max(ls, s - MONEY_WINDOW),
+                                                                    min(le, e + MONEY_WINDOW))):
+            hits[0] += 1
+            return "[amount]"
+        return m.group(0)
+    return RX_WORD_AMOUNT.sub(wrepl, text), hits[0]
+
+
+# Money sentence backstop (the model can leave sentences like "[amount] in den Index-ETF investiert" or
+# "12'000 Franke Schulde bi de Bank" visible). Policy: anyone's investments, portfolio, trading and
+# money troubles (debts), the owner's own included, are [private: money]. In code, after the model and the money net,
+# a sentence of a message body becomes "[private: money]" when it has
+#   - an investment word (ETF, Aktie(n), Fonds, Depot, Portfolio, Krypto, Bitcoin/BTC, stocks, Sparplan, Säule 3a,
+#     MSCI, Dividende, Rendite, Trading) with a personal sign: I/you/we/my/his/Sie..., an [amount], or a buy/sell/hold
+#     or invest verb;
+#   - an investing verb (investiert, inveschtiert, invested, nachgekauft) with a personal sign, an [amount] or an
+#     investment word; not "Ziit/Zeit/time/energy investiert" without an amount or investment word;
+#   - a debt noun (Schulde(n), verschuldet, Betreibung/Betreibig, Pfändung, Privatkonkurs, pleite, debt(s)) with a
+#     personal sign or an [amount]. "Du schuldsch mir no 18.- fürs Kino" (a verb) and "technical debt" stay.
+# Chat prefixes, tgread tails, "Subject: " and list bullets stay. Not with --keep-own-money (admin documents);
+# regex_pass runs it after the money net: on the anonymized text and again on paraphrases and summaries.
+_INVEST_NOUN = (r"etf\w*|[^\W\d_]*aktie\w*|[^\W\d_]*fonds|depot\w*|portfolio\w*|portefeuille\w*|krypto\w*|crypto\w*|"
+                r"bitcoin\w*|btc|ethereum|altcoins?|stocks|stock\s+(?:market|portfolio|options?|picks?)|equities|"
+                r"index\s?funds?|mutual\s?funds?|brokerage\w*|broker|wertschrift\w*|wertpapier\w*|[^\W\d_]*sparplan\w*|"
+                r"säule\s?3a|msci|nasdaq|vanguard|ishares|dividend\w*|rendite\w*|trading|daytrad\w*|getradet|tradet|"
+                r"traden")
+_INVEST_VERB = r"invest(?!ig)\w*|invesch\w*|nachgekauft|nachkauf\w*|nachgchauft|nochegchauft"
+_DEBT_NOUN = (r"schulden|schulde|schuldä|schuldenberg\w*|schuldenfalle|verschuld\w*|betreibung\w*|betreibig\w*|"
+              r"pfändung\w*|gepfändet|privatkonkurs\w*|debts?|indebted|overdraft\w*|pleite|pleiti|bankrott|bankrupt\w*")
+MONEY_TOPIC = re.compile(r"(?i)(?<![^\W\d_])(?:(?P<inv>" + _INVEST_NOUN + r")|(?P<verb>" + _INVEST_VERB + r")|(?P<debt>"
+                         + _DEBT_NOUN + r"))(?![^\W\d_])")
+MONEY_PERSONAL = re.compile(
+    r"(?i)(?<![^\W\d_])(?:ich|mir|mich|mi|mis|mini|mine|mim|minere|mein\w*|du|di|dir|dich|dis|dini|dine|dim|dinere|"
+    r"dein\w*|er|sie|si|ihm|ihn|ihr\w*|sein\w*|sini|sis|wir|mer|mier|üs|eus|uns|unser\w*|euse|eusi|euch|eue|euer\w*|"
+    r"eure\w*|i(?=\s+(?:ha|han|hett|hetti|bi|bin|cha|chan|wett|wott|mues|würd|hät))|me|my|myself|we|us|our\w*|you|"
+    r"your\w*|he|she|him|his|her|hers|they|them|their\w*)(?![^\W\d_])")
+MONEY_DEAL_VERB = re.compile(
+    r"(?i)(?<![^\W\d_])(?:kauf\w*|gekauft|chauf\w*|gchauft|kouft|verkauf\w*|verchauf\w*|vercheuf\w*|buy\w*|bought|"
+    r"sell\w*|sold|halte|hält|halten|hold\w*|besitz\w*|own(?:s|ed)?|angelegt|aaglegt|anlegen|eingezahlt|iizahlt|"
+    r"ibezahlt|gespart|gspart|sparen|spare)(?![^\W\d_])")
+INVEST_EFFORT = re.compile(
+    r"(?i)(?<![^\W\d_])(?:zeit|ziit|time|energie|energy|mühe|müeh|effort|arbeit|work|stunde\w*|stund|std|hours?|"
+    r"herzblut|liebe|love|nerven|kraft|gedanke\w*|thoughts?|schweiss|tränen|freizeit|wochenende|weekend)(?![^\W\d_])")
+TECH_DEBT = re.compile(r"(?i)(?<![^\W\d_])(?:technical|tech|technische[nr]?|technischi)[\s-]+(?:debts?|schulden?)"
+                       r"(?![^\W\d_])")
+BODY_LEAD = re.compile(r"(?:Subject:[ \t]?|[-*•][ \t]+|\d{1,2}[.)][ \t]+)")
+
+
+def money_sentence(sent):
+    """True: the sentence talks about someone's investments or debts (see the money sentence backstop above)."""
+    s = TECH_DEBT.sub(" ", sent)
+    inv = verb = debt = False
+    for m in MONEY_TOPIC.finditer(s):
+        inv, verb, debt = inv or bool(m.group("inv")), verb or bool(m.group("verb")), debt or bool(m.group("debt"))
+    if not (inv or verb or debt):
+        return False
+    amount = "[amount]" in s.lower()
+    personal = MONEY_PERSONAL.search(s) is not None
+    if verb and not (inv or amount) and INVEST_EFFORT.search(s):
+        verb = False                                             # "Ziit investiert": time, not money
+    if inv and (personal or amount or verb or MONEY_DEAL_VERB.search(s)):
+        return True
+    if verb and (personal or amount):
+        return True
+    return debt and (personal or amount)
+
+
+def money_backstop(text):
+    """-> (text with every investment/debt sentence of a message body -> '[private: money]', hits)."""
+    if not MONEY_TOPIC.search(text):
+        return text, 0
+    spans = []
+    for lm in re.finditer(r"[^\n]+", text):
+        bs, be = body_bounds(text, lm.start(), lm.end())
+        lead = BODY_LEAD.match(text, bs, be)
+        if lead:
+            bs = lead.end()
+        if bs >= be or not MONEY_TOPIC.search(text, bs, be):
+            continue
+        cuts = [bs] + [p for p in sentence_ends(text, bs, be) if bs < p < be] + [be]
+        for x, y in zip(cuts, cuts[1:]):
+            while x < y and text[x].isspace():
+                x += 1
+            while y > x and text[y - 1].isspace():
+                y -= 1
+            if x < y and money_sentence(text[x:y]):
+                if spans and not text[spans[-1][1]:x].strip() and "\n" not in text[spans[-1][1]:x]:
+                    spans[-1] = (spans[-1][0], y)                # adjacent sentences share one placeholder
+                else:
+                    spans.append((x, y))
+    out, last = [], 0
+    for s, e in spans:
+        out += [text[last:s], "[private: money]"]
+        last = e
+    out.append(text[last:])
+    return "".join(out), len(spans)
+
+
+CONTENT_HOSTS = re.compile(r"(?i)^(?:https?://)?(?:www\.|m\.|music\.)?(youtube\.com|youtu\.be|open\.spotify\.com|"
+                           r"soundcloud\.com|x\.com|twitter\.com|instagram\.com|tiktok\.com|reddit\.com|"
+                           r"[a-z]{2}\.wikipedia\.org|github\.com|imdb\.com|ra\.co|galaxus\.ch|digitec\.ch)(/[^?#]*)?(\?[^#]*)?")
+
+
+def clean_url(m):
+    """Public content links (videos, tracks, posts, articles) stay, minus tracking/sharer params like si= or
+    igsh=; other links with tokens or IDs become [link: domain]."""
+    url = m.group(0)
+    c = CONTENT_HOSTS.match(url)
+    if c and c.end() >= len(url.split("#")[0]):
+        q = [kv for kv in (c.group(3) or "?")[1:].split("&") if kv.split("=")[0] in ("v", "list", "t")]
+        base = url.split("?")[0].split("#")[0]
+        return base + ("?" + "&".join(q) if q else "")
+    return link_placeholder(url) if token_link(url) else url
+
+
+def token_link(url):
+    """True if a URL carries a token / share id / personal id (long random-looking parts, query strings)."""
+    if re.search(r"[?&#](?:[^=&#]*(?:token|key|share|invite|sig|auth|session|code|id|usp|s)\b[^=&#]*)=", url, re.I):
+        return True
+    for part in re.split(r"[/?&=#._-]", url):
+        if len(part) >= 8 and re.search(r"\d", part) and re.search(r"[A-Za-z]", part):
+            return True
+        if len(part) >= 6 and part.isdigit():
+            return True
+    return "drive.google" in url or "/folders/" in url or "t.me/+" in url or "joinchat" in url
+
+
+def luhn(digits):
+    d = [int(c) for c in digits]
+    return (sum(d[-1::-2]) + sum(sum(divmod(2 * x, 10)) for x in d[-2::-2])) % 10 == 0
+
+
+def card_repl(m):
+    """13-15 digits only if Luhn-valid (cards always are; Telegram chat ids like -1001234567890 mostly aren't);
+    16-19 digits always. Never right after 'chat', '#' or 'id' (tgread headers, message refs)."""
+    digits = re.sub(r"\D", "", m.group(0))
+    if re.search(r"(?i)(?:chat\s*-?|#|\bid[:=\s]\s*-?)$", m.string[max(0, m.start() - 8):m.start()]):
+        return m.group(0)
+    if len(digits) < 16 and not luhn(digits):
+        return m.group(0)
+    return "[card number]"
+
+
+def secret_repl(m):
+    """Mask the value after a password/PIN/code keyword. With ':'/'=' any value; with 'is'/'ist'/a bare space only a
+    value with a digit (so 'the code is great' stays); never a time or 'dress/zip/QR code'."""
+    kw, sep, val = m.group(1), m.group(2) + m.group(3), m.group(4)
+    core = val.rstrip(".!?)")
+    if re.search(r"(?i)\b(?:dress|zip|area|post(?:al)?|qr|source|promo|country|colou?r)\s*$",
+                 m.string[max(0, m.start() - 12):m.start()]):
+        return m.group(0)
+    if len(core) < 3 or re.fullmatch(r"\d{1,2}[:.h]\d{2}", core) or core.startswith("["):
+        return m.group(0)
+    if not re.search(r"[:=]", sep) and not (re.search(r"\d", core) and len(core) >= 4):
+        return m.group(0)
+    return kw + sep + "[secret]" + val[len(core):]
+
+
+def regex_pass(text, money=True, all_amounts=False):
+    counts = {}
+
+    def sub(rx, repl, s, key):
+        def f(m):
+            r = repl(m) if callable(repl) else repl
+            if r != m.group(0):
+                counts[key] = counts.get(key, 0) + 1
+            return r
+        return rx.sub(f, s)
+
+    text = sub(RX_EMAIL, "[email]", text, "email")
+    text = sub(RX_URL, clean_url, text, "link")
+    text = sub(RX_IBAN, lambda m: "[IBAN]" if sum(c.isdigit() for c in m.group(0)) >= 10 else m.group(0), text, "iban")
+    text = sub(RX_AHV, "[AHV number]", text, "ahv")
+    text = sub(RX_PHONE_INTL, "[phone]", text, "phone")
+    text = sub(RX_PHONE_NAT, "[phone]", text, "phone")
+    text = sub(RX_CARD, card_repl, text, "card")
+    text = sub(RX_PLATE, "[license plate]", text, "plate")
+    text = sub(RX_BIRTH_AFTER, lambda m: m.group(1) + "[birthdate]", text, "birthdate")
+    text = sub(RX_BIRTH_BEFORE, lambda m: "[birthdate]" + m.group(2), text, "birthdate")
+    text = sub(RX_HANDLE, "@[user]", text, "handle")
+    text = sub(RX_ACCOUNT, lambda m: m.group(1) + m.group(2) + "[account number]", text, "account")
+    text = sub(RX_POSTAL_ACCOUNT, "[account number]", text, "account")
+    text = sub(RX_SECRET, secret_repl, text, "secret")
+    if money:
+        text, n = money_pass(text, all_amounts)
+        if n:
+            counts["amount"] = n
+        text, n = money_backstop(text)                           # investments and debts -> [private: money]
+        if n:
+            counts["private_money"] = n
+    return text, counts
+
+
+def chat_senders(text):
+    lines = [l for l in text.splitlines() if l.strip()]
+    found, hits = [], 0
+    for l in lines:
+        for rx in CHAT_PREFIX:
+            m = rx.match(l)
+            if m:
+                hits += 1
+                n = m.group(1).strip()
+                if n and n not in found:
+                    found.append(n)
+                break
+    return found if lines and hits >= 0.3 * len(lines) else []
+
+
+VENUE_WORD = (r"(?:Garten|Bar|Café|Cafe|Restaurant|Ristorante|Club|Klub|Halle|Lounge|Pub|Bistro|Beiz|Stübli|Brauerei|"
+              r"Pizzeria|Hotel|Kino|Theater|Arena|Stadion|Grill|Kitchen)\b")
+
+
+def venue_only(name, text):
+    """True if a model-proposed 'person' only ever occurs as part of a venue name ("Frau Gerolds Garten")."""
+    toks, titled = name_tokens(name)
+    if not toks or (len(toks) > 1 and not titled):
+        return False
+    rx = re.compile(r"(?<!%s)%s(?:'s|’s|s)?(?!%s)(\s+%s)?" % (WORD, re.escape(toks[-1]), WORD, VENUE_WORD))
+    occ = list(rx.finditer(text))
+    return bool(occ) and all(m.group(1) for m in occ)
+
+
+# ---- private passages (policy v2): the model quotes them, code finds and replaces them in the original text
+PRIVATE_LABEL = {c: c.replace("_", " ") for c in PRIVATE_CATEGORIES}
+# tgread block header "### Title (group, chat -100123)": never redacted (tgread splits its output on it)
+BLOCK_HEADER = re.compile(r"^### .*\([\w ?-]+, chat (?:-?\d+|C\d+)\)")          # C1: tgread's IdShield
+# tgread line tail: " [photo; edited] (#123 reply to #120)  <== match" is never redacted
+LINE_TAIL = re.compile(r"(?:\s\[[^\[\]\n]*\])?\s\(#M?\d+(?: reply to #M?\d+)?\)(?:\s+<== match)?\s*$")   # #M1: shielded
+EMOJI = "\u2600-\u27bf\U0001F000-\U0001FAFF"
+SENT_END = re.compile(r"(?:[.!?…]+|[%s][%s\ufe0f\u200d]*)[\"'”’»)\]]*(?=\s|$)" % (EMOJI, EMOJI))
+ABBREV = {"dr", "prof", "hr", "fr", "frl", "st", "ca", "bzw", "usw", "etc", "vs", "mr", "mrs", "ms", "inkl", "nr",
+          "evtl", "ev", "jr", "sr", "str", "tel", "ggf", "zb", "bsp", "geb", "sog", "min", "max", "approx", "no"}
+ABOUT_WRITER = {"", "writer", "the writer", "me", "myself", "i", "ich", "mir", "mich", "self", "sender", "author", "none",
+                "n/a", "unknown"}
+# words that look like a surname in "Lenas Mueter" / "her Brother" but are relations
+RELATION_WORDS = {"mueter", "mutter", "mama", "mami", "vater", "vatter", "papa", "papi", "bruder", "brüeder", "brueder",
+                  "schwester", "schwöschter", "schwoeschter", "freund", "freundin", "fründ", "fründin", "frau", "mann",
+                  "ex", "chef", "chefin", "boss", "grosi", "oma", "opa", "tante", "onkel", "cousin", "cousine",
+                  "kollege", "kollegin", "nachbar", "nachbarin", "sohn", "tochter", "kind", "baby", "partner",
+                  "partnerin", "mom", "mum", "dad", "brother", "sister", "boyfriend", "girlfriend", "wife", "husband",
+                  "friend", "family", "familie", "eltern", "parents"}
+
+
+def norm_index(s):
+    """(casefolded letters and digits of s, index in s of each of them): for whitespace/punctuation-blind search."""
+    chars, idx = [], []
+    for i, c in enumerate(s):
+        if c.isalnum():
+            for cc in c.casefold():
+                chars.append(cc)
+                idx.append(i)
+    return "".join(chars), idx
+
+
+def _nkey(s):
+    return "".join(c.casefold() for c in s if c.isalnum())
+
+
+def line_at(text, pos):
+    ls = text.rfind("\n", 0, pos) + 1
+    le = text.find("\n", pos)
+    return ls, (len(text) if le < 0 else le)
+
+
+def body_bounds(text, ls, le):
+    """The redactable part of a line: after a chat prefix '[ts] Name: ' (or leading indent), before a tgread tail."""
+    line = text[ls:le]
+    if BLOCK_HEADER.match(line):
+        return le, le
+    bs = 0
+    for rx in CHAT_PREFIX:
+        m = rx.match(line)
+        if m:
+            bs = m.end()
+            break
+    else:
+        bs = len(line) - len(line.lstrip())
+    m = LINE_TAIL.search(line)
+    be = m.start() if m and m.start() >= bs else len(line)
+    return ls + bs, ls + be
+
+
+def line_sender(text, ls):
+    """The chat sender of the line at ls; for an indented continuation line, that of the message it continues."""
+    for _ in range(200):
+        line = text[ls:line_at(text, ls)[1]]
+        for rx in CHAT_PREFIX:
+            m = rx.match(line)
+            if m:
+                return m.group(1).strip()
+        if not line[:1].isspace() or ls == 0:
+            return None
+        ls = line_at(text, ls - 1)[0]
+    return None
+
+
+def sentence_ends(text, bs, be):
+    """Positions just after each sentence end in text[bs:be] (., !, ?, … or an emoji, before whitespace). Not after
+    abbreviations, initials or dates ('Dr.', 'K.', '18.10. am')."""
+    out = []
+    for m in SENT_END.finditer(text, bs, be):
+        tok = m.group(0)
+        if tok[0] == "." and not tok.startswith(".."):
+            before = text[max(bs, m.start() - 12):m.start()]
+            if before[-1:].isdigit():
+                nxt = text[m.end():be].lstrip()[:1]
+                if not (nxt.isalpha() and nxt.isupper()):
+                    continue
+            else:
+                w = re.search(r"([^\W\d_]+)$", before)
+                if not w or len(w.group(1)) == 1 or w.group(1).lower() in ABBREV:
+                    continue
+        out.append(m.end())
+    return out
+
+
+def expand_to_sentence(text, s, e, bs, be):
+    ends = sentence_ends(text, bs, be)
+    start = max([p for p in ends if p <= s] + [bs])
+    while start < s and text[start].isspace():
+        start += 1
+    end = min([p for p in ends if p >= e] + [be])
+    return start, end
+
+
+def locate(text, span, lo, hi, norm):
+    """Where the model's quote is: ([(start, end)], how). Exact (whitespace-tolerant) anywhere; else ignoring case,
+    spaces and punctuation; else its first/last words as anchors inside the chunk text[lo:hi]; else the chunk line
+    sharing most of its words (then that whole message is redacted). Over-redaction beats a leak."""
+    words = span.split()
+    if not words:
+        return [], None
+    found = [(m.start(), m.end()) for m in re.finditer(r"\s+".join(map(re.escape, words)), text)]
+    if found:
+        return found, "exact"
+    ns, nmap = norm
+    key = _nkey(span)
+    if len(key) >= 6:
+        i = ns.find(key)
+        while i >= 0:
+            found.append((nmap[i], nmap[i + len(key) - 1] + 1))
+            i = ns.find(key, i + 1)
+        if found:
+            return found, "fuzzy"
+    nlo, nhi = bisect.bisect_left(nmap, lo), bisect.bisect_left(nmap, hi)
+    if len(words) >= 6:
+        k = min(4, len(words) // 2)
+        a, b = _nkey(" ".join(words[:k])), _nkey(" ".join(words[-k:]))
+        i = ns.find(a, nlo, nhi) if len(a) >= 6 else -1
+        if i >= 0 and len(b) >= 6:
+            j = ns.find(b, i + len(a), min(nhi, i + len(a) + max(400, 2 * len(key))))
+            if j >= 0:
+                return [(nmap[i], nmap[j + len(b) - 1] + 1)], "anchors"
+    toks = set(re.findall(r"[^\W_]{3,}", span.casefold()))
+    if len(toks) >= 2:
+        best, pos = None, lo
+        while pos < hi:
+            ls, le = line_at(text, pos)
+            lt = set(re.findall(r"[^\W_]{3,}", text[ls:le].casefold()))
+            hit = len(toks & lt) / len(toks)
+            if hit >= 0.6 and (best is None or hit > best[0]):
+                best = (hit, ls, le)
+            pos = le + 1
+        if best:
+            # within that line, the run of sentences that share most of their words with the quote (else all of it)
+            bs, be = body_bounds(text, best[1], best[2])
+            cuts = [bs] + [p for p in sentence_ends(text, bs, be) if p < be] + [be]
+            sel = []
+            for a, b in zip(cuts, cuts[1:]):
+                st = set(re.findall(r"[^\W_]{3,}", text[a:b].casefold()))
+                if st and len(st & toks) / len(st) >= 0.5:
+                    sel.append((a, b))
+            if sel:
+                return [(sel[0][0], sel[-1][1])], "line"
+            return [(bs, be)], "line"
+    return [], None
+
+
+def private_plausible(span, senders):
+    t = span.strip(" \t\n.,;:!?\"'()[]")
+    if len(t) < 3 or not re.search(r"[^\W\d_]", t):
+        return False
+    if TIME_OR_AMOUNT.match(t) or DATE_NO_YEAR.match(t) or DAY_WORDS.match(t):
+        return False
+    names = {People._norm(s) for s in senders} | {tok.lower() for s in senders for tok in name_tokens(s)[0]}
+    return People._norm(t) not in names and t.lower() not in names
+
+
+def surname_of(name, senders, text):
+    """The surname to mask for a person attached to a private passage, or None. A first name alone is looked up among
+    the chat senders ('Lena' -> 'Lena Brunner'); 'Lenas Mueter' or 'her brother' are not names."""
+    toks, titled = name_tokens(name)
+    if not toks:
+        return None
+    if not titled and len(toks) == 1:
+        cands = {s for s in senders if len(name_tokens(s)[0]) > 1
+                 and name_tokens(s)[0][0].casefold() == toks[0].casefold()}
+        if len(cands) != 1:
+            return None
+        toks, titled = name_tokens(cands.pop())
+    if not titled:
+        if len(toks) > 3 or toks[0].lower() in NOT_NAMES or toks[0].lower() in RELATION_WORDS:
+            return None
+        if re.search(r"(?:'s|’s)$", toks[0]) or (toks[0].endswith("s") and any(
+                name_tokens(s)[0][:1] and name_tokens(s)[0][0].casefold() == toks[0][:-1].casefold() for s in senders)):
+            return None                                   # possessive: "Lenas Mueter"
+        if not re.search(r"(?<!%s)%s\s+%s(?!%s)" % (WORD, re.escape(toks[0]), re.escape(toks[-1]), WORD), text):
+            return None                                   # the full name never occurs: nothing to tie it to
+    sur = toks[-1]
+    if len(sur) < 2 or not sur[:1].isupper() or sur.lower() in RELATION_WORDS or sur.lower() in NOT_NAMES:
+        return None
+    return sur
+
+
+def mask_surnames(text, surnames):
+    for s in sorted(surnames, key=len, reverse=True):
+        rx = re.compile(r"(?<!%s)%s(['’]s|s)?(?!%s)" % (WORD, re.escape(s), WORD))
+        text = rx.sub(lambda m: "[surname]" + ("'s" if m.group(1) else ""), text)
+    return text
+
+
+def check_sentence(sentence, message, admin=False):
+    """The model's second opinion on one flagged sentence -> a category, or None (not private)."""
+    user = "Message: <<<%s>>>\nSentence: <<<%s>>>" % (message, sentence)
+    system = CHECK_SYSTEM_ADMIN if admin else CHECK_SYSTEM
+    schema = CHECK_SCHEMA_ADMIN if admin else CHECK_SCHEMA
+    ck = None
+    if CACHE:                                         # the verdict only (a category, "?" or None), never the text
+        ck = CACHE.key_for("check", {"system": system, "schema": schema, "user": user, "max_tokens": 24})
+        hit = CACHE.get("check", ck)
+        if isinstance(hit, dict) and (hit.get("c") is None or hit.get("c") == "?" or hit.get("c") in PRIVATE_LABEL):
+            return hit.get("c")
+    out, _ = chat([{"role": "system", "content": system}, {"role": "user", "content": user}],
+                  max_tokens=24, temperature=0.0, schema=schema, label="check")
+    try:
+        cat = json.loads(out).get("category")
+        verdict = cat if cat in PRIVATE_LABEL else None
+    except (ValueError, AttributeError):
+        verdict = "?"                                 # unreadable answer: keep the detector's verdict
+    if CACHE:
+        CACHE.put("check", ck, {"c": verdict})
+    return verdict
+
+
+def apply_private(text, items, senders, owner, check=None):
+    """items: [(model item, chunk start, chunk end)] -> (text with each private sentence replaced by
+    '[private: category]', stats, surnames to mask). Each quote is located and widened to whole sentences; with
+    check(sentence, message) every one of those sentences gets a second opinion and only confirmed ones go (with
+    the checker's category). Chat prefixes and tgread line tails are never touched, so lines, senders and message
+    refs stay; adjacent redacted sentences share one placeholder."""
+    norm = norm_index(text)
+    cands = {}                                        # (start, end) -> {"cat", "about", "ls"}
+    st = {"private_spans_from_model": len(items), "private_unmatched": 0, "private_located": {}}
+    owner_n = People._norm(owner) if owner else None
+    for item, lo, hi in items:
+        span = (item.get("text") or "").strip()
+        cat = item.get("category") if item.get("category") in PRIVATE_LABEL else "confidential"
+        if not private_plausible(span, senders):
+            continue
+        regions, how = locate(text, span, lo, hi, norm)
+        if not regions:
+            st["private_unmatched"] += 1
+            continue
+        if len(regions) > 3:                          # a short quote found all over the text: only its own chunk
+            regions = [r for r in regions if lo <= r[0] < hi][:3]
+        st["private_located"][how] = st["private_located"].get(how, 0) + 1
+        for s, e in regions:
+            ls = line_at(text, s)[0]
+            while ls < e and ls <= len(text):
+                le = line_at(text, ls)[1]
+                bs, be = body_bounds(text, ls, le)
+                cs, ce = max(s, bs), min(e, be)
+                if ce > cs and re.search(r"[^\W_]", text[cs:ce]):
+                    a, b = expand_to_sentence(text, cs, ce, bs, be)
+                    cuts = [a] + [p for p in sentence_ends(text, a, b) if a < p < b] + [b]
+                    for x, y in zip(cuts, cuts[1:]):        # one candidate per sentence
+                        while x < y and text[x].isspace():
+                            x += 1
+                        if re.search(r"[^\W\d_]", text[x:y]):
+                            c = cands.setdefault((x, y), {"cats": [], "about": (item.get("about") or "").strip(),
+                                                          "ls": ls, "body": (bs, be)})
+                            if cat not in c["cats"]:
+                                c["cats"].append(cat)
+                ls = le + 1
+    st["private_candidates"] = len(cands)
+    verdicts, intervals, surnames, bycat = {}, [], set(), {}
+    for (x, y), c in sorted(cands.items()):
+        cats = c["cats"]
+        if check is not None:
+            sent = " ".join(text[x:y].split())
+            if sent not in verdicts:
+                verdicts[sent] = check(sent, " ".join(text[c["body"][0]:c["body"][1]].split()))
+            if verdicts[sent] is None:
+                continue
+            cats = cats if verdicts[sent] == "?" else [verdicts[sent]]
+        for cat in cats:
+            intervals.append((x, y, cat))
+            bycat[cat] = bycat.get(cat, 0) + 1
+        about = c["about"]                            # its subject and its writer are attached
+        for person in (line_sender(text, c["ls"]), None if about.lower() in ABOUT_WRITER else about):
+            if person and People._norm(person) not in (owner_n, "you"):
+                sur = surname_of(person, senders, text)
+                if sur and not (owner_n and sur.lower() in owner_n.split()):
+                    surnames.add(sur)
+    st["private_rejected_by_check"] = len(cands) - len({(x, y) for x, y, _ in intervals})
+    st["private_by_category"] = bycat
+    merged = []
+    for s, e, cat in sorted(intervals):
+        if merged and (s <= merged[-1][1] or (not text[merged[-1][1]:s].strip() and "\n" not in text[merged[-1][1]:s])):
+            ps, pe, pc = merged[-1]
+            merged[-1] = (ps, max(pe, e), pc + ([cat] if cat not in pc else []))
+        else:
+            merged.append((s, e, [cat]))
+    out, last = [], 0
+    for s, e, cats in merged:
+        out.append(text[last:s])
+        out.append("[private: %s]" % ", ".join(PRIVATE_LABEL[c] for c in cats))
+        last = e
+    out.append(text[last:])
+    st["private_redactions"] = len(merged)
+    return "".join(out), st, surnames
+
+
+def detect(chunks, system, schema, user_fmt, known=None, label="detect", numbered=True):
+    """One grammar-constrained detection call per chunk -> yields (chunk index, data dict). numbered=False (the default
+    detector): no "(part i of n)" in the request, so a chunk's request depends on its text only and the
+    cache reuses it when the window around it moves."""
+    for i, ch in enumerate(chunks):
+        part = " (part %d of %d)" % (i + 1, len(chunks)) if len(chunks) > 1 and numbered else ""
+        user = user_fmt % {"known": known() if known else "", "part": part, "text": ch}
+        ck, data = None, None
+        if CACHE:
+            ck = CACHE.key_for("detect", {"system": system, "schema": schema, "user": user, "max_tokens": 3072})
+            ref = CACHE.get("detect", ck)
+            if ref is not None:
+                try:
+                    data = from_refs(ref, user, CACHE.crypt(ck))
+                except (ValueError, TypeError, KeyError, UnicodeDecodeError):
+                    data = None
+        if data is None:
+            out, finish = chat([{"role": "system", "content": system}, {"role": "user", "content": user}],
+                               max_tokens=3072, temperature=0.0, schema=schema,
+                               label="%s %d/%d" % (label, i + 1, len(chunks)))
+            try:
+                data = json.loads(out)
+            except ValueError:
+                raise LLMError("the local LLM returned invalid JSON while detecting personal data (chunk %d%s)"
+                               % (i + 1, ", output cut off" if finish == "length" else ""), 4)
+            if CACHE and isinstance(data, dict):
+                try:
+                    CACHE.put("detect", ck, to_refs(data, user, enc=CACHE.crypt(ck)))
+                except NotCacheable:
+                    CACHE_STATS.setdefault("detect_not_stored", [0, 0])[1] += 1
+        yield i, data if isinstance(data, dict) else {}
+
+
+def anonymize(text, owner, chunk_chars, stats_out, strict=False, keep_money=False, all_amounts=False):
+    """-> (anonymized text, reapply(str) -> str for re-applying the name rules to a summary).
+    Default (policy v2): names, addresses and facts stay; private passages, identifiers and the surnames of people
+    attached to private passages go. strict: also every private person -> Person A/B/..., addresses, locations.
+    keep_money: admin documents (v2 money rule, no business category, no [amount] net).
+    all_amounts: the owner's own mail: the money net masks every amount (see money_pass)."""
+    senders = chat_senders(text)
+    people = People(owner)
+    chunks = chunk_lines(text, chunk_chars)
+    offs = [0]
+    for ch in chunks:
+        offs.append(offs[-1] + len(ch))
+    spans, private = [], []
+    if strict:                                       # pass 1 (strict only): the pre-v2 people + personal-data detector
+        for n in senders:                            # deterministic safety net for chat logs
+            if not (owner and People._norm(n) == People._norm(owner)):
+                people.add(n)
+        fmt = ("Known people so far: %(known)s\n\nFind the people and personal data in this text%(part)s:\n<<<\n"
+               "%(text)s\n>>>")
+        for i, data in detect(chunks, DETECT_SYSTEM_STRICT, DETECT_SCHEMA_STRICT, fmt,
+                              lambda: people.known() or "(none yet)", "people"):
+            for p in data.get("people") or []:
+                if isinstance(p, dict) and isinstance(p.get("name"), str):
+                    names = [p["name"]] + [v for v in p.get("variants") or [] if isinstance(v, str)]
+                    if people.find(names) is None and all(venue_only(n, text) for n in names):
+                        continue                     # a venue like "Frau Gerolds Garten", not a person
+                    people.add(names[0], names[1:])
+            spans += [s for s in data.get("pii") or [] if isinstance(s, dict)]
+    fmt = "Find the private passages and identifiers in this text%(part)s:\n<<<\n%(text)s\n>>>"
+    for i, data in detect(chunks, DETECT_SYSTEM_ADMIN if keep_money else DETECT_SYSTEM,     # private passages +
+                          DETECT_SCHEMA_ADMIN if keep_money else DETECT_SCHEMA, fmt,      # identifiers (all modes)
+                          numbered=False):
+        spans += [s for s in data.get("identifiers") or [] if isinstance(s, dict)]
+        private += [(p, offs[i], offs[i + 1]) for p in data.get("private") or []
+                    if isinstance(p, dict) and isinstance(p.get("text"), str)]
+    out, pst, surnames = apply_private(text, private, senders, owner,
+                                       lambda sent, msg: check_sentence(sent, msg, keep_money))
+    out = apply_spans(out, spans)
+    if strict:
+        surnames = set()
+
+        def reapply(s):
+            return apply_people(s, people)
+    else:
+        def reapply(s):
+            return mask_surnames(apply_people(s, people) if owner else s, surnames)
+    out, counts = regex_pass(reapply(out), money=not keep_money, all_amounts=all_amounts)
+    if counts.get("private_money") and not strict:   # the money backstop's lines: their writers' surnames go too,
+        owner_n = People._norm(owner) if owner else None                             # like apply_private's
+        for lm in re.finditer(r"[^\n]*\[private: money\][^\n]*", out):
+            person = line_sender(out, lm.start())
+            if person and People._norm(person) not in (owner_n, "you"):
+                sur = surname_of(person, senders, text)
+                if sur and not (owner_n and sur.lower() in owner_n.split()):
+                    surnames.add(sur)
+        out = mask_surnames(out, surnames)
+    stats_out.update({"mode": "strict" if strict else "default", "chunks": len(chunks), "policy": POLICY,
+                      "own_money": "kept" if keep_money else "redacted"})
+    if all_amounts:
+        stats_out["amounts"] = "all"
+    if strict:
+        stats_out["people"] = len([p for p in people.persons if p["alias"] != "You"])
+    stats_out.update(pst)
+    stats_out.update({"identifier_spans_from_model": len(spans), "surnames_masked": len(surnames),
+                      "regex_pass_hits": counts})
+    if pst["private_unmatched"]:
+        print("llm-local: warning: %d private passage(s) reported by the model could not be located in the text"
+              % pst["private_unmatched"], file=sys.stderr)
+    return out, reapply
+
+
+def summarize(anon, extra, max_tokens, strict=False, keep_money=False):
+    if keep_money:
+        system = SUMMARY_SYSTEM_STRICT.replace(_SUMMARY_MONEY, "") if strict else SUMMARY_SYSTEM_ADMIN
+    else:
+        system = SUMMARY_SYSTEM_STRICT if strict else SUMMARY_SYSTEM
+    system += ("\n\nAdditional instructions: " + extra if extra else "")
+    budget = ctx_size() - max_tokens - count_tokens(system) - 300
+    parts = [anon]
+    if count_tokens(anon) > budget:                  # too long for one pass: detailed summary per part
+        n = max(2, -(-count_tokens(anon) // max(budget, 1000)))
+        parts = chunk_lines(anon, max(2000, len(anon) // n + 1))
+    outs = []
+    for i, part in enumerate(parts):
+        hdr = "" if len(parts) == 1 else " (part %d of %d)" % (i + 1, len(parts))
+        msgs = [{"role": "system", "content": system},
+                {"role": "user", "content": "Summarize this%s:\n<<<\n%s\n>>>" % (hdr, part)}]
+        txt, ck = None, None
+        if CACHE:                                     # summaries are built from anonymized text only (sealed)
+            ck = CACHE.key_for("summary", {"messages": msgs, "max_tokens": max_tokens})
+            txt = CACHE.unseal(ck, CACHE.get("summary", ck))
+        if txt is None:
+            txt, _ = chat(msgs, max_tokens=max_tokens, temperature=0.3, presence=0.5, label="summary%s" % hdr)
+            if CACHE:
+                CACHE.put("summary", ck, CACHE.seal(ck, txt))
+        outs.append(("## Part %d of %d\n" % (i + 1, len(parts)) if len(parts) > 1 else "") + txt)
+    return "\n\n".join(outs)
+
+
+# ---------------------------------------------------------------- paraphrase (policy v4)
+# Policy v4: the vault summarizes and paraphrases the messages without changing any meaning, numbers or
+# facts; all remaining redactions still apply. --paraphrase runs on the ANONYMIZED text only (after the regex net, the
+# detector + per-sentence check and the regex/money nets), and the nets run again on its result:
+#   - What: every message body. Chat lines keep '[ts] Name: ' and the tail ' [photo] (#123 reply to #120)' in code;
+#     only the text between them is rewritten. Mail: the text after 'Subject: ' and each paragraph. Headers ('### …'),
+#     blank lines, '[service: …]' lines and messages of one or two words stay as they are.
+#   - How: ONE grammar-constrained call per batch (≤ PARA_BATCH_CHARS / PARA_BATCH_ITEMS, cut where the content says so,
+#     like the anonymizer's chunks): {"p": [one paraphrase per item, in order]}. Output language: the item's own (v4.1,
+#     the original language, never translated; translating Swiss German turned "da meh nid chan
+#     reserviere müend mer so früeh gah" into "early booking is required" and "am 4i" into "by the 4th").
+#   - Code check per message: every number (digits, Swiss thousands separators, number words), weekday, month and
+#     today/tomorrow/yesterday in the paraphrase must occur in that message's anonymized text; its bracket
+#     placeholders ([private: …], [amount], [phone], …) must be exactly the input's; at most ~2x as long. v4.1: a number
+#     keeps its role (clock time vs date/ordinal, num_roles), a sentence with a negation keeps one (negations), and
+#     an item in German/Swiss German doesn't come back in English or the other way round (text_lang).
+#   - A failing message is retried once (one call for all of them, told what was wrong); still failing -> the
+#     anonymized text verbatim, marked "[not paraphrased]". Never raw: the model never saw anything else.
+# Summaries (--summary --paraphrase): the same number/date/placeholder check on each summary line against the whole
+# anonymized input; retried once; lines still failing are left out and counted in a "[not paraphrased]" note.
+PARA_BATCH_CHARS = 3000
+PARA_BATCH_ITEMS = 30
+PARA_ITEM_MAX = 1500                             # a longer paragraph is split at sentence ends into several items
+PARA_MIN_WORDS = 3                               # fewer words: kept as written (nothing to compress)
+PARA_MARK = "[not paraphrased]"
+PARA_SYSTEM = """You rewrite chat messages and e-mail text for the personal assistant of their owner. The text was already anonymized. Each numbered item is one message, or one part of an e-mail. Rewrite EVERY item as a short, neutral paraphrase in the SAME language as the item.
+
+Rules:
+- Never translate. Swiss German stays Swiss German (you may normalize the spelling a little), Standard German stays Standard German (never rewrite it in Swiss German), English stays English, French stays French. When in doubt, keep the item's own words.
+- Keep the meaning exactly and keep every fact: who, what, when, where, plans, decisions, questions, requests, answers, reasons, names, places, addresses, dates, times, numbers.
+- Keep every negation: what is "nid", "nöd", "nicht", "kein", "nie", "not", "no" or "never" in the item stays negated.
+- Copy every number, date and time exactly as written ("07:30" stays "07:30", "12.10." stays "12.10.", "2" stays "2"). A clock time stays a clock time: in Swiss German "am 4i", "um 4", "am vieri", "halbi 5" and "17i" are times of day, never dates or ordinals. Never calculate, convert or add a date, weekday, time or number that is not in the item. Relative words (today, tomorrow, next week) stay relative.
+- Copy names of people, places, venues, streets, companies and products exactly as written.
+- Copy every placeholder in square brackets exactly as it is, e.g. [private: health], [amount], [phone], [surname], [link: example.com]. Never guess or describe what a placeholder hides.
+- Add nothing: no opinions, guesses, explanations or new details. Leave out greetings and filler words. A message that only greets, thanks or reacts becomes a few words saying so, in its language.
+- Keep the writer's perspective: "I" stays the writer, "you" the person written to. A question stays a question.
+- One line per item, plain and neutral, shorter than the original where possible.
+
+Answer with JSON only: {"p": ["<item 1 rewritten>", "<item 2 rewritten>", ...]}, exactly one string per item, in order."""
+PARA_RETRY = ("Your previous rewrite of these items changed facts:\n%s\nRewrite them again, in each item's own language "
+              "(never translate). Copy every number, date, time and placeholder exactly as it is in the item, keep clock "
+              "times as times and every negation, and add nothing.")
+SUMMARY_RETRY = ("\n\nIMPORTANT: your previous summary used numbers or dates that are not in the text: %s. Use only "
+                 "numbers, dates and times exactly as they are written in the text.")
+
+
+def para_schema(n):
+    return {"type": "object", "properties": {"p": {"type": "array", "items": {"type": "string"},
+                                                   "minItems": n, "maxItems": n}},
+            "required": ["p"], "additionalProperties": False}
+
+
+_NUMBER_WORDS = {}
+for _n, _ws in {0: "zero null zéro zero", 1: "one first eins ein eine einen einem einer eis erste ersten un une uno una",
+                2: "two second zwei zwo zwöi zwoi deux due zweite", 3: "three third drei drü drüü trois tre dritte",
+                4: "four vier vieri quatre quattro", 5: "five fünf föif füf foif cinq cinque",
+                6: "six sechs sächs sei", 7: "seven sieben sibe siebe sept sette", 8: "eight acht achti huit otto",
+                9: "nine neun nüün nün nüni neuf nove", 10: "ten zehn zäh zäni zeni dix dieci",
+                11: "eleven elf elfi onze undici", 12: "twelve dozen zwölf zwölfi douze dodici",
+                13: "thirteen dreizehn drizäh", 14: "fourteen vierzehn vierzäh", 15: "fifteen fünfzehn füfzäh quarter viertel",
+                16: "sixteen sechzehn sächzäh", 17: "seventeen siebzehn sibezäh", 18: "eighteen achtzehn achtzäh",
+                19: "nineteen neunzehn nüünzäh", 20: "twenty zwanzig zwänzg vingt venti", 30: "thirty dreissig dreißig drissg trente trenta half halb halbi",
+                40: "forty vierzig vierzg", 45: "quarter viertel", 50: "fifty fünfzig füfzg", 60: "sixty sechzig",
+                70: "seventy siebzig", 80: "eighty achtzig", 90: "ninety neunzig", 100: "hundred hundert cent cento",
+                1000: "thousand tausend tuusig mille"}.items():
+    for _w in _ws.split():
+        _NUMBER_WORDS.setdefault(_w, set()).add(_n)
+_OUT_NUMBER_WORDS = {w: n for w, n in (("two", 2), ("three", 3), ("four", 4), ("five", 5), ("six", 6), ("seven", 7),
+                                        ("eight", 8), ("nine", 9), ("ten", 10), ("eleven", 11), ("twelve", 12),
+                                        ("twenty", 20), ("thirty", 30), ("forty", 40), ("fifty", 50), ("hundred", 100),
+                                        ("thousand", 1000))}
+_DAY_NAMES = {1: "monday montag mäntig mentig maentig lundi lunedì lunedi mon mo", 2: "tuesday dienstag zischtig tuesday mardi martedì martedi tue tues di",
+              3: "wednesday mittwoch mittwuch mittwoch mercredi mercoledì mercoledi wed mi",
+              4: "thursday donnerstag dunschtig donschtig jeudi giovedì giovedi thu thur thurs do",
+              5: "friday freitag friitig fritig frittig vendredi venerdì venerdi fri fr",
+              6: "saturday samstag samschtig samstig sonnabend samedi sabato sat sa",
+              7: "sunday sonntag sunntig sonntig dimanche domenica sun so"}
+_MONTH_NAMES = {1: "january januar jänner janvier gennaio jan", 2: "february februar feber février fevrier febbraio feb",
+                3: "march märz maerz mars marzo mar mär", 4: "april avril aprile apr",
+                5: "may mai maggio", 6: "june juni juin giugno jun", 7: "july juli juillet luglio jul",
+                8: "august août aout agosto aug", 9: "september septembre settembre sep sept",
+                10: "october oktober octobre ottobre oct okt", 11: "november novembre nov",
+                12: "december dezember décembre decembre dicembre dec dez"}
+_REL_NAMES = {"today": "today tonight heute heut hüt hütt hüüt hit aujourd'hui oggi stasera",
+              "tomorrow": "tomorrow morgen morn moorn morä demain domani",
+              "yesterday": "yesterday gestern geschter gester gescht hier ieri"}
+
+
+def _name_index(table):
+    return {w: k for k, ws in table.items() for w in ws.split()}
+
+
+_DAY_IN, _MONTH_IN, _REL_IN = _name_index(_DAY_NAMES), _name_index(_MONTH_NAMES), _name_index(_REL_NAMES)
+_OUT_DAYS = re.compile(r"\b(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)s?\b"
+                       r"|\b(Mon|Tue|Tues|Wed|Thu|Thur|Thurs|Fri|Sat|Sun)\b\.?,?\s?(?=\d)")
+_OUT_DAY_INDEX = {"monday": 1, "mon": 1, "tuesday": 2, "tue": 2, "tues": 2, "wednesday": 3, "wed": 3, "thursday": 4,
+                  "thu": 4, "thur": 4, "thurs": 4, "friday": 5, "fri": 5, "saturday": 6, "sat": 6, "sunday": 7, "sun": 7}
+_OUT_MONTHS = re.compile(r"\b(January|February|March|April|June|July|August|September|October|November|December)\b"
+                         r"|(?<=\d\s)(May|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\b\.?"
+                         r"|\b(May|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?(?=\s?\d)")
+_OUT_REL = re.compile(r"\b(today|tonight|tomorrow|yesterday)\b", re.I)
+_NUM_GROUP = re.compile(r"\d{1,3}(?:['’ ,.]\d{3})+(?!\d)|\d+")
+_NUM_TOKEN = re.compile(r"\d+(?:[:.,'’]\d+)*")          # 07:30, 12.10.2026, 1'000, 2.5: reported as written
+_TIME_RE = re.compile(r"\b(\d{1,2})[:.h](\d{2})\b")
+_HALF_RE = re.compile(r"(?i)\b(halb|halbi|half past|viertel nach|viertel vor|quarter past|quarter to)\s+(\w+)")
+PH_REQUIRED = re.compile(r"\[(?:private:[^\]\n]{1,40}|amount|phone|e-?mail|address|iban|account(?: number)?|"
+                         r"card(?: number)?|ahv(?: number)?|id number|secret|license plate|birthdate|"
+                         r"link(?::[^\]\n]{0,80})?|url(?::[^\]\n]{0,40})?|surname|location|name|number|username|user|"
+                         r"redacted|code|token)\]", re.I)
+_BRACKET = re.compile(r"\[[^\[\]\n]{1,80}\]")
+
+
+def _words(s):
+    return re.findall(r"[^\W\d_]+(?:'[^\W\d_]+)?", s.lower())
+
+
+def allowed_facts(src):
+    """(numbers, weekdays, months, relative days) a paraphrase of src may mention: what src says, in any language."""
+    nums = set()
+    for m in _NUM_GROUP.finditer(src):
+        g = m.group(0)
+        nums.add(int(re.sub(r"\D", "", g)))
+        nums.update(int(x) for x in re.findall(r"\d+", g))
+    words = _words(src)
+    for w in words:
+        nums |= _NUMBER_WORDS.get(w, set())
+    for m in _TIME_RE.finditer(src):                  # 19:00 may become "7 pm"
+        h = int(m.group(1))
+        if 12 < h < 24:
+            nums.add(h - 12)
+    for h, rs in num_roles(src).items():              # "17i" / "um 17" may become "5 pm" (v4.1)
+        if "time" in rs and 12 < h < 24:
+            nums.add(h - 12)
+    for m in _HALF_RE.finditer(src):                  # "halb acht" = 7:30, "viertel vor acht" = 7:45
+        hs = _NUMBER_WORDS.get(m.group(2).lower(), set()) | ({int(m.group(2))} if m.group(2).isdigit() else set())
+        for h in hs:
+            nums |= {h - 1, h, 15, 30, 45}
+    days = {_DAY_IN[w] for w in words if w in _DAY_IN}
+    months = {_MONTH_IN[w] for w in words if w in _MONTH_IN} | {n for n in nums if 1 <= n <= 12}
+    rel = {_REL_IN[w] for w in words if w in _REL_IN}
+    if "abend" in words or "znacht" in words or "abig" in words:
+        rel.add("today")                              # "heute Abend" -> tonight
+    return nums, days, months, rel
+
+
+# v4.1: a number keeps its role. Swiss German clock times: "am 4i", "um 4", "am vieri", "halbi 5",
+# "17i", "4 Uhr"; dates/ordinals: "4th", "am 4.", "12.10.", "4. Oktober", "fourth", "vierte". "4i" -> "the 4th" changes
+# a time into a date: the paraphrase falls back. Ambiguous forms count for neither role.
+_HOUR_WORDS = {"eis": 1, "eins": 1, "zwei": 2, "zwöi": 2, "zwoi": 2, "drü": 3, "drüü": 3, "drei": 3, "vieri": 4,
+               "vier": 4, "füfi": 5, "föifi": 5, "fünfi": 5, "fünf": 5, "füf": 5, "sächsi": 6, "sechsi": 6, "sechs": 6,
+               "sibni": 7, "sibeni": 7, "siebni": 7, "sieben": 7, "achti": 8, "acht": 8, "nüni": 9, "nüüni": 9,
+               "neun": 9, "zähni": 10, "zäni": 10, "zehni": 10, "zehn": 10, "elfi": 11, "elf": 11, "zwölfi": 12,
+               "zwölf": 12}
+_HOUR_I = {w for w in _HOUR_WORDS if w.endswith("i") and w not in ("eis", "zwei", "zwoi", "drei")}
+_ORD_WORDS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6, "seventh": 7, "eighth": 8,
+              "ninth": 9, "tenth": 10, "eleventh": 11, "twelfth": 12, "erste": 1, "zweite": 2, "dritte": 3, "vierte": 4,
+              "fünfte": 5, "sechste": 6, "siebte": 7, "achte": 8, "neunte": 9, "zehnte": 10, "elfte": 11, "zwölfte": 12}
+_PREP_T = r"(?:am|um|ab|bis|gege|gegen|vor|nach|at|by|around|until|till|à|vers)"
+_NOT_HOUR = (r"(?!\s*(?:[.:,/\d]\d|\.|st\b|nd\b|rd\b|th\b|lüt|leute|personen|people|persons|guys|tag|tage|day|days|"
+             r"woche|wochen|week|weeks|monat|monate|month|months|jahr|jahre|year|years|mal|times|stück|chf|fr\b|eur|"
+             r"franken|%|jan|feb|mär|mar|apr|mai|may|jun|jul|aug|sep|okt|oct|nov|dez|dec))")
+_TIME_FORMS = [re.compile(r"(?i)\b(\d{1,2})[:h](\d{2})\b"),                          # 07:30, 7h30
+               re.compile(r"(?i)\b(\d{1,2})i\b"),                                      # 4i, 17i
+               re.compile(r"(?i)\b(\d{1,2})\s*(?:uhr|pm|p\.m\.|a\.m\.|o'clock|oclock)"),  # 4 Uhr, 5 pm
+               re.compile(r"\b(\d{1,2})\.(1[3-9]|[2-5]\d)\b(?!\.\d)"),               # 19.30 (not a month: 13-59)
+               re.compile(r"(?i)\b%s\s+(?:ca\.?\s+|so\s+)?(\d{1,2})\b%s" % (_PREP_T, _NOT_HOUR)),  # um 4, at 4
+               re.compile(r"(?i)\bhalbi?\s+(\d{1,2})\b")]                              # halbi 5
+_MONTH_ALT = "|".join(sorted({w for ws in _MONTH_NAMES.values() for w in ws.split() if len(w) >= 3}, key=len,
+                             reverse=True))
+_DATE_FORMS = [re.compile(r"(?i)\b(\d{1,2})(?:st|nd|rd|th)\b"),                         # 4th
+               re.compile(r"(?i)\b(?:am|vom|bis|ab|zum|per|den|dem|der|on)\s+(\d{1,2})\.(?!\d)"),  # am 4.
+               re.compile(r"(?<![\d.])\b(\d{1,2})\.(0?[1-9]|1[0-2])\.(?:\d{2,4})?(?![\d:])"),  # 12.10. / 12.10.2026
+               re.compile(r"(?i)\b(\d{1,2})\.?\s+(?:of\s+)?(?:%s)\b" % _MONTH_ALT),       # 4 October
+               re.compile(r"(?i)\b(?:%s)\.?\s+(\d{1,2})(?:st|nd|rd|th)?\b(?![:.]\d)" % _MONTH_ALT)]  # October 4
+
+
+def num_roles(s):
+    """{number: {'time', 'date'}} for the numbers s uses as clock times or as dates/ordinals (v4.1)."""
+    roles = {}
+    low = s.lower()
+    for rx in _TIME_FORMS:
+        for m in rx.finditer(s):
+            roles.setdefault(int(m.group(1)), set()).add("time")
+    for m in re.finditer(r"(?i)\b(?:%s|halbi?|viertel ab|viertel vor|viertel nach)\s+(%s)\b"
+                         % (_PREP_T, "|".join(_HOUR_WORDS)), low):
+        roles.setdefault(_HOUR_WORDS[m.group(1)], set()).add("time")
+    for w in _words(low):
+        if w in _HOUR_I:                                # "vieri", "füfi": always a time of day
+            roles.setdefault(_HOUR_WORDS[w], set()).add("time")
+        o = _ORD_WORDS.get(re.sub(r"(?<=e)[nmrs]$", "", w))
+        if o:
+            roles.setdefault(o, set()).add("date")
+    for rx in _DATE_FORMS:
+        for m in rx.finditer(s):
+            for g in m.groups():
+                if g:
+                    roles.setdefault(int(g), set()).add("date")
+    return roles
+
+
+def role_problems(src_roles, out):
+    bad = []
+    for n, rs in sorted(num_roles(out).items()):
+        have = src_roles.get(n, set())
+        if "date" in rs and "date" not in have and "time" in have:
+            bad.append("%d is a clock time in the item, not a date or ordinal" % n)
+        if "time" in rs and "time" not in have and "date" in have:
+            bad.append("%d is a date in the item, not a clock time" % n)
+    return bad
+
+
+# v4.1: a sentence with a negation keeps one. Swiss "no" means "still/yet", so "no" counts in the item only when it reads
+# as English; in the paraphrase every negation word counts.
+_NEG = set("nid nöd nüd ned nit nöt nööd nicht nichts nix nüt nüüt nie niemals nümm nümme nüme nöme niemer niemert "
+           "niemand kei keis keini kein keine keinen keinem keiner keins kän käs not never none nobody nothing "
+           "nowhere neither nor cannot pas jamais rien aucun aucune non".split())
+_DE_MARK = set("ich du er mir mer mier wir ihr isch ist sind bin bisch händ hend hät het hesch hast habe haben und oder "
+               "aber dass der dem den es zum zur mit für vo von uf auf scho schon nid nöd nicht chan cha chasch kann "
+               "kannst gah gaht geht gönd müend müssen mues muss wott wänn wenn wie wer au auch eus üs uns emol mal "
+               "gnueg genug lüt leute morn hüt heute gsi chunt chunsch chume".split())
+_EN_MARK = set("i you he she we they it are was were be been have has had do does did would could should the and or but "
+               "that this these those to of on at for with from by about not yes my your our their there here what when "
+               "where who how can is need needs must because since enough people going".split())
+# Language check: a translation like "Mein Lohn wurde auf [amount] im Monat erhöht" -> "My salary increased to
+# [amount] per month" must fail even when the item has a single German marker word. Hence many marker words,
+# lowercase words with ä/ö/ü/ß count as German, placeholders are ignored, and an item that only LEANS German (or
+# English) still fails when its paraphrase is clearly in the other language. Also Swiss German -> Standard German
+# ("Swiss German stays Swiss German") when the item has only Swiss and the paraphrase only Standard markers.
+# And the other way round (a Standard German item must not come back in Swiss German, e.g. "Die Hochzeit ist nicht
+# am 12." -> "D Hochziit isch nöd am 12."): an item with Standard
+# and no Swiss markers whose paraphrase has >= 2 Swiss markers (more than Standard ones) is retried, then marked.
+_DE_MARK |= set("mein meine meinen meinem meiner dein deine deinen sein seine seinen ihre ihren unser unsere wurde "
+                "wurden wird werden war waren hat vom beim zum die das ein eine einen einem einer nicht noch nach bei "
+                "bis über sehr wieder endlich heute morgen gestern jetzt dann weil doch ja nein bitte danke sich mich "
+                "dich ihm ihn ihnen euch kein keine nichts nie mini dini sini gsi öppe chli nüt gäll um uhr im "
+                "montag dienstag mittwoch donnerstag freitag samstag sonntag mäntig zischtig mittwuch dunschtig "
+                "friitig fritig samschtig sunntig januar februar märz mai juni juli oktober dezember".split())
+_EN_MARK |= set("just very into after before again them us his him its it's i'm i'll i've i'd don't won't can't isn't "
+                "aren't wasn't didn't doesn't that's there's let's which were monday tuesday wednesday thursday "
+                "friday saturday sunday january february march june july october december".split())
+_CH_MARK = set("isch bisch händ hend hät het hesch gsi nöd nid nüt nüme nümm chan cha chasch chum chume chunt "
+               "chunsch chömed gah gaht gönd gömmer müend mues muesch wott wotsch wänn eus üs emol morn hüt öppe chli "
+               "mega gäll dihei ned nöt zmorge znacht gseh gsehsch gässe gmacht gschribe säg säge lueg luege "
+               "mini dini sini öppis zrugg träffed hochziit gäld zmittag mäntig zischtig mittwuch dunschtig fritig "
+               "friitig samstig samschtig sunntig".split())
+_STD_MARK = set("ist bin bist habe haben hast hat nicht nichts kann kannst können gehen geht gehe müssen muss "
+                "musst willst uns einmal morgen heute etwas zuhause gewesen kommt komme kommst war waren gestern "
+                "sehr".split())
+
+
+def _lang_words(s):
+    return re.findall(r"(?<!\d)\b[^\W\d_]+(?:'[^\W\d_]+)?", _BRACKET.sub(" ", s))   # not the "i" of Swiss "17i"
+
+
+def lang_scores(s):
+    """(German marker count, English marker count) of s; placeholders don't count."""
+    ws = _lang_words(s)
+    low = [w.lower() for w in ws]
+    de = sum(w in _DE_MARK for w in low) + sum(1 for w in ws if w[:1].islower() and re.search("[äöüß]", w))
+    de += sum(1 for k, w in enumerate(low) if w == "am" and (k == 0 or low[k - 1] != "i"))   # German "am", not "I am"
+    return de, sum(w in _EN_MARK for w in low)
+
+
+def text_lang(s):
+    """'de' (German/Swiss German), 'en' or None (too few words to tell)."""
+    de, en = lang_scores(s)
+    if de >= 2 and de > 2 * en:
+        return "de"
+    if en >= 2 and en > 2 * de:
+        return "en"
+    return None
+
+
+def lang_problem(src, out):
+    """None, or why the paraphrase out is not in the language of the item src."""
+    lo = text_lang(out)
+    if lo:
+        de, en = lang_scores(src)
+        lean = text_lang(src) or ("de" if de > en else "en" if en > de else None)
+        if lean and lean != lo:
+            names = {"de": "German", "en": "English"}
+            return "it translates the item into %s; write it in %s like the item" % (names[lo], names[lean])
+    sw = [w.lower() for w in _lang_words(src)]
+    ow = [w.lower() for w in _lang_words(out)]
+    if sum(w in _CH_MARK for w in sw) >= 2 and not any(w in _STD_MARK for w in sw) \
+            and not any(w in _CH_MARK for w in ow) and sum(w in _STD_MARK for w in ow) >= 2:
+        return "it turns Swiss German into Standard German; keep the item's Swiss German"
+    ch_out = sum(w in _CH_MARK for w in ow)
+    if any(w in _STD_MARK for w in sw) and not any(w in _CH_MARK for w in sw) and lang_scores(src)[0] > \
+            lang_scores(src)[1] and ch_out >= 2 and ch_out > sum(w in _STD_MARK for w in ow):
+        return "it turns Standard German into Swiss German; keep the item's Standard German"
+    return None
+
+
+def negations(s, item=False):
+    """Item: the number of sentences with a negation. Paraphrase: the number of negation words."""
+    def neg_words(t, english):
+        ws = _words(t.replace("’", "'"))
+        return sum(w in _NEG or (w == "no" and english) or w.endswith("n't") for w in ws)
+    if not item:
+        return neg_words(s, True)
+    return sum(1 for sent in re.split(r"(?<=[.!?;])\s+|\n", s) if neg_words(sent, text_lang(sent) == "en"))
+
+
+def para_problems(src, out, facts=None, required=True):
+    """What a paraphrase of src (anonymized) changed: [] if fine. facts: allowed_facts(src), precomputed."""
+    nums, days, months, rel = facts or allowed_facts(src)
+    bad = []
+    for m in _NUM_TOKEN.finditer(out):
+        g = m.group(0)
+        runs = [int(x) for x in re.findall(r"\d+", g)]
+        if not all(x in nums for x in runs) and not (len(runs) > 1 and int(re.sub(r"\D", "", g)) in nums):
+            bad.append("the number %s is not in it" % g)
+    for w, n in _OUT_NUMBER_WORDS.items():
+        if n not in nums and re.search(r"\b%s\b" % w, out, re.I):
+            bad.append("the number '%s' is not in it" % w)
+    for m in _OUT_DAYS.finditer(out):
+        if _OUT_DAY_INDEX[(m.group(1) or m.group(2)).lower()] not in days:
+            bad.append("the weekday %s is not in it" % m.group(0).strip("."))
+    for m in _OUT_MONTHS.finditer(out):
+        name = (m.group(1) or m.group(2) or m.group(3)).lower()
+        if _MONTH_IN.get(name, 0) not in months:
+            bad.append("the month %s is not in it" % m.group(0).strip("."))
+    for m in _OUT_REL.finditer(out):
+        if _REL_IN[m.group(1).lower()] not in rel:
+            bad.append("'%s' is not in it" % m.group(1))
+    bad += role_problems(num_roles(src), out)
+    have = {re.sub(r"\s+", " ", x.lower()) for x in _BRACKET.findall(src)}
+    got = {re.sub(r"\s+", " ", x.lower()) for x in _BRACKET.findall(out)}
+    if got - have:
+        bad.append("it adds %s" % ", ".join(sorted(got - have)))
+    if required:
+        need = {re.sub(r"\s+", " ", x.lower()) for x in PH_REQUIRED.findall(src)}
+        if need - got:
+            bad.append("it drops %s" % ", ".join(sorted(need - got)))
+    return bad
+
+
+def _ok_item(src, out):
+    """None if out is a usable paraphrase of src, else the reasons."""
+    if not isinstance(out, str) or not out.strip():
+        return ["it is empty"]
+    out = out.strip()
+    bad = para_problems(src, out)
+    if len(out) > max(80, 2 * len(src) + 40):
+        bad.append("it is much longer than the item")
+    if negations(out) < negations(src, item=True):    # v4.1
+        bad.append("it drops a negation (keep nid / nöd / nicht / kein / not / never)")
+    lang = lang_problem(src, out)
+    if lang:
+        bad.append(lang)
+    return bad or None
+
+
+CHAT_TAIL = re.compile(r"(?:\s\[[^\[\]\n]*\])?\s\(#M?\d+(?: reply to #M?\d+)?\)(?:\s+<== match)?\s*$")
+PARA_CHAT = [re.compile(r"^\s*\[[^\]\n]{4,40}\]\s*[^:\n]{1,80}?:\s"), CHAT_PREFIX[1]]   # the sender may hold [surname]
+SUBJECT = re.compile(r"^(Subject:[ \t]?)(.*)$")
+
+
+def para_units(text):
+    """text -> [('keep', line) | ['item', prefix, body, tail]] (the body is what gets rewritten; prefix and tail stay)."""
+    units, para = [], None
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        i += 1
+        if not ln.strip() or ln.startswith("### ") or BLOCK_HEADER.match(ln):
+            units.append(("keep", ln))
+            para = None
+            continue
+        m = next((m for m in (rx.match(ln) for rx in PARA_CHAT) if m), None)
+        if m:
+            body = [ln[m.end():]]
+            while i < len(lines) and lines[i].startswith("    ") and lines[i].strip():
+                body.append(lines[i].strip())         # a message's continuation lines
+                i += 1
+            joined = " ".join(b.strip() for b in body if b.strip())
+            t = CHAT_TAIL.search(joined)
+            tail = joined[t.start():] if t else ""
+            units.append(["item", ln[:m.end()], joined[:t.start()] if t else joined, tail])
+            para = None
+            continue
+        m = SUBJECT.match(ln)
+        if m:                                         # mail: the subject (and ' | ' parts of an event line)
+            segs = m.group(2).split(" | ")
+            for k, seg in enumerate(segs):
+                pre = m.group(1) if k == 0 else " | "
+                if re.fullmatch(r"\s*\[[^\[\]\n]*\]\s*|\s*Attachments:.*", seg) and k:
+                    units.append(["item", pre, "", seg])  # bulk marker, size note, attachment names: as they are
+                else:
+                    units.append(["item", pre, seg, ""])
+            para = None
+            continue
+        if para is not None and units[para][0] == "item":
+            units[para][2] += " " + ln.strip()            # a paragraph: consecutive plain lines
+        else:
+            units.append(["item", "", ln.strip(), ""])
+            para = len(units) - 1
+    out = []                                              # very long paragraphs: several items
+    for u in units:
+        if u[0] == "item" and len(u[2]) > PARA_ITEM_MAX:
+            parts, cur = [], ""
+            for s in re.split(r"(?<=[.!?…])\s+", u[2]):
+                if cur and len(cur) + len(s) + 1 > PARA_ITEM_MAX:
+                    parts.append(cur)
+                    cur = ""
+                cur = (cur + " " + s).strip()
+                while len(cur) > PARA_ITEM_MAX:
+                    parts.append(cur[:PARA_ITEM_MAX])
+                    cur = cur[PARA_ITEM_MAX:]
+            if cur:
+                parts.append(cur)
+            for k, p in enumerate(parts):
+                out.append(["item", u[1] if k == 0 else " ", p, u[3] if k == len(parts) - 1 else ""])
+        else:
+            out.append(u)
+    return out
+
+
+def para_wanted(body):
+    """Rewrite this body? Not: empty, placeholders/emojis only, '[service: …]', fewer than PARA_MIN_WORDS words."""
+    if not body.strip() or re.fullmatch(r"\s*\[service:[^\]]*\]\s*", body):
+        return False
+    return len([w for w in _words(_BRACKET.sub(" ", body)) if len(w) >= 2]) >= PARA_MIN_WORDS
+
+
+def para_batches(idx, bodies):
+    """Item indices -> batches of at most PARA_BATCH_CHARS / PARA_BATCH_ITEMS. Like the anonymizer's chunks
+    (chunk_lines), an item whose content hash says so is a cut point; it ends a batch when the items since the
+    previous cut point hold a sixth of the limit, and a full batch ends at its last unused cut point, so a sliding
+    window keeps its earlier batches (and their cache entries)."""
+    def cost(xs):
+        return sum(len(bodies[i]) + 8 for i in xs)
+    out, cur, seg, soft = [], [], 0, 0
+    for i in idx:
+        n = len(bodies[i]) + 8
+        if cur and (cost(cur) + n > PARA_BATCH_CHARS or len(cur) >= PARA_BATCH_ITEMS):
+            if soft and cost(cur[soft:]) + n <= PARA_BATCH_CHARS and len(cur) - soft < PARA_BATCH_ITEMS:
+                out.append(cur[:soft])
+                cur = cur[soft:]
+            else:
+                out.append(cur)
+                cur = []
+            soft = 0
+        cur.append(i)
+        seg += n
+        if int(hashlib.sha256(bodies[i].encode("utf-8", "replace")).hexdigest()[:8], 16) % 8 == 0:
+            if seg >= PARA_BATCH_CHARS // 6:
+                out.append(cur)
+                cur, soft = [], 0
+            else:
+                soft = len(cur)
+            seg = 0
+    if cur:
+        out.append(cur)
+    return out
+
+
+def para_call(texts, notes=None, label="paraphrase"):
+    """One grammar-constrained call -> one string per text (None for each if the answer is unusable)."""
+    lines = ["[%d] %s" % (k + 1, " ".join(t.split())) for k, t in enumerate(texts)]
+    user = ((PARA_RETRY % "\n".join(notes) + "\n\n") if notes else "") + \
+        "Rewrite these %d items:\n<<<\n%s\n>>>" % (len(texts), "\n".join(lines))
+    max_tokens = min(8192, 200 + 12 * len(texts) + sum(len(t) for t in texts) // 2)
+    msgs = [{"role": "system", "content": PARA_SYSTEM}, {"role": "user", "content": user}]
+    schema = para_schema(len(texts))
+    ck, out = None, None
+    if CACHE:                         # the batch's answer, sealed: built from anonymized text only, checked again below
+        ck = CACHE.key_for("para", {"messages": msgs, "schema": schema, "max_tokens": max_tokens})
+        out = CACHE.unseal(ck, CACHE.get("para", ck))
+    fresh = out is None
+    if fresh:
+        out, _ = chat(msgs, max_tokens=max_tokens, temperature=0.0, schema=schema, label=label)
+    try:
+        got = json.loads(out).get("p")
+    except (ValueError, AttributeError):
+        got = None
+    if not isinstance(got, list) or len(got) != len(texts):
+        return [None] * len(texts)
+    if CACHE and fresh:               # only usable answers; every code check still runs on every call
+        CACHE.put("para", ck, CACHE.seal(ck, out))
+    return [re.sub(r"^\[\d+\]\s*", "", " ".join(x.split())) if isinstance(x, str) else None for x in got]
+
+
+def paraphrase(text, stats_out):
+    """Anonymized text -> the same lines, every message body as a checked paraphrase in its own language (v4.1)."""
+    units = para_units(text)
+    items = [k for k, u in enumerate(units) if u[0] == "item" and para_wanted(u[2])]
+    bodies = {k: units[k][2].strip() for k in items}
+    result, todo = {}, []
+    batches = para_batches(items, bodies)
+    for b, batch in enumerate(batches):
+        got = para_call([bodies[k] for k in batch], label="paraphrase %d/%d" % (b + 1, len(batches)))
+        for k, p in zip(batch, got):
+            bad = _ok_item(bodies[k], p)
+            if bad:
+                todo.append((k, bad))
+            else:
+                result[k] = p.strip()
+    retried, fallback = len(todo), 0
+    for r, chunk in enumerate([todo[x:x + PARA_BATCH_ITEMS] for x in range(0, len(todo), PARA_BATCH_ITEMS)]):
+        notes = ["[%d] %s" % (n + 1, "; ".join(bad)) for n, (k, bad) in enumerate(chunk)]
+        got = para_call([bodies[k] for k, _ in chunk], notes, label="paraphrase retry %d" % (r + 1))
+        for (k, _), p in zip(chunk, got):
+            if _ok_item(bodies[k], p):
+                result[k] = PARA_MARK + " " + bodies[k]   # never raw: the anonymized text, marked
+                fallback += 1
+            else:
+                result[k] = p.strip()
+    out = []
+    for k, u in enumerate(units):
+        if u[0] == "keep":
+            out.append(u[1])
+        else:
+            body = result.get(k, u[2].strip())
+            line = u[1] + body + u[3]
+            if u[1] in (" | ", " ") and out:          # a later ' | ' part or a split paragraph: same line
+                out[-1] += line
+            else:
+                out.append(line)
+    stats_out["paraphrase"] = {"items": len(items), "kept_short": sum(1 for u in units if u[0] == "item") - len(items),
+                               "calls": len(batches) + (-(-retried // PARA_BATCH_ITEMS) if retried else 0),
+                               "retried": retried, "not_paraphrased": fallback}
+    return "\n".join(out)
+
+
+def verify_summary(summary, anon, redo, stats_out):
+    """--summary --paraphrase: each summary line's numbers, dates and placeholders must be in the anonymized text.
+    One retry (redo(note) -> a new summary); lines still failing are left out and counted in a closing note."""
+    facts = allowed_facts(anon)
+
+    def bad_lines(s):
+        return [(i, b) for i, ln in enumerate(s.split("\n")) if not re.fullmatch(r"## Part \d+ of \d+", ln.strip())
+                for b in [para_problems(anon, ln, facts, required=False)] if b]
+    bad = bad_lines(summary)
+    st = {"retried": 0, "lines_left_out": 0}
+    if bad:
+        vals = sorted({x.split(" ")[2] if x.startswith("the ") else x for _, b in bad for x in b})
+        summary = redo(SUMMARY_RETRY % ", ".join(vals[:20]))
+        st["retried"] = 1
+        bad = bad_lines(summary)
+    if bad:
+        drop = {i for i, _ in bad}
+        lines = [ln for i, ln in enumerate(summary.split("\n")) if i not in drop]
+        lines.append("%s %d summary line(s) left out: they held a number or date that is not in the messages."
+                     % (PARA_MARK, len(drop)))
+        summary = "\n".join(lines)
+        st["lines_left_out"] = len(drop)
+    stats_out["summary_check"] = st
+    return summary
+
+
+# ---------------------------------------------------------------- main
+def vault_backend():
+    """True when the local LLM lives in the privacy vault (env LLM_LOCAL_BACKEND, else ~/.config/llm-local/backend)."""
+    b = os.environ.get("LLM_LOCAL_BACKEND")
+    if b is None:
+        try:
+            with open(os.path.expanduser("~/.config/llm-local/backend"), encoding="utf-8") as f:
+                b = f.read()
+        except OSError:
+            b = ""
+    return b.strip() == "vault"
+
+
+def main():
+    if vault_backend():
+        vault = os.environ.get("LLM_LOCAL_VAULT_BIN") or os.path.expanduser("~/bin/vault")
+        try:
+            os.execv(vault, [vault, "llm-run", "--"] + sys.argv[1:])
+        except OSError as e:
+            die("cannot run the vault client %s: %s" % (vault, e.strerror), 3)
+    ap = argparse.ArgumentParser(prog="llm-local", description="Local LLM (127.0.0.1 only). Prompt on stdin.")
+    ap.add_argument("--system", help="system prompt (with --summary: extra summary instructions)")
+    ap.add_argument("--max-tokens", type=int, default=None, help="max tokens to generate (default 1024; summary 1500)")
+    ap.add_argument("--json", action="store_true", help="ask for a JSON object; print it validated")
+    ap.add_argument("--schema", help="a JSON schema: grammar-constrained JSON output (implies --json; the privacy "
+                    "vault's answers)")
+    ap.add_argument("--temp", type=float, default=0.7, help="temperature (default 0.7)")
+    ap.add_argument("--anonymize", action="store_true",
+                    help="redact private passages and identifiers, keep names, addresses and facts verbatim")
+    ap.add_argument("--summary", action="store_true", help="with --anonymize (implied): detailed summary of that")
+    ap.add_argument("--strict", action="store_true",
+                    help="maximum anonymity: also alias every name (Person A/B) and mask addresses/locations")
+    ap.add_argument("--owner-name", help="the owner's name in the text; becomes 'You'")
+    ap.add_argument("--keep-own-money", action="store_true",
+                    help="admin documents (his bills, payslips, tax papers): keep the owner's own money details "
+                         "(policy v2 money rule, no business category, no [amount] net)")
+    ap.add_argument("--all-amounts", action="store_true",
+                    help="the owner's own mail (receipts, orders, bank notices): the money net masks every currency "
+                         "amount, every labelled number and bare cents, any size (policy v3.1)")
+    ap.add_argument("--paraphrase", action="store_true",
+                    help="policy v4, after --anonymize (implied): rewrite every message body as a "
+                         "short, neutral paraphrase in its own language (v4.1: never translated) that keeps every fact; numbers, dates and placeholders "
+                         "are checked in code (one retry, then the anonymized text marked [not paraphrased]); with "
+                         "--summary: the summary is checked the same way")
+    ap.add_argument("--cache-dir", help="anonymization cache (the privacy vault's private jobs only; env "
+                                        "LLM_LOCAL_CACHE_DIR): detections as positions, check verdicts, summaries "
+                                        "and paraphrase batches (sealed)")
+    ap.add_argument("--chunk-chars", type=int, default=6000, help="anonymize chunk size in characters")
+    ap.add_argument("--stats", action="store_true", help="print speed and counts to stderr")
+    ap.add_argument("--no-start", action="store_true", help="don't start the server if it's down")
+    ap.add_argument("--timeout", type=int, default=1800, help="per-request timeout in seconds")
+    a = ap.parse_args()
+    if a.summary or a.strict or a.keep_own_money or a.all_amounts or a.paraphrase:
+        a.anonymize = True
+    if a.keep_own_money and a.all_amounts:
+        die("--all-amounts can't be combined with --keep-own-money", 2)
+    if a.max_tokens is not None and a.max_tokens < 1:
+        die("--max-tokens must be >= 1", 2)
+    if a.chunk_chars < 500:
+        die("--chunk-chars must be >= 500", 2)
+    if a.json and a.anonymize:
+        die("--json can't be combined with --anonymize/--summary/--strict/--keep-own-money/--all-amounts/"
+            "--paraphrase", 2)
+    text = sys.stdin.read()
+    if not text.strip():
+        die("empty input on stdin", 2)
+    extra = {}
+    global CACHE
+    try:
+        ensure_server(a.no_start)
+        cdir = a.cache_dir or os.environ.get("LLM_LOCAL_CACHE_DIR")
+        if a.anonymize and cdir:                     # never for a plain prompt (the caller's own text)
+            try:
+                CACHE = AnonCache(cdir)
+            except OSError:                           # an unusable cache folder: the work runs without it
+                CACHE_STATS.setdefault("cache_unavailable", [0, 0])[1] += 1
+        if a.anonymize:
+            out, reapply = anonymize(text, a.owner_name, a.chunk_chars, extra, a.strict, a.keep_own_money,
+                                     a.all_amounts)
+            if a.summary:   # the model only sees the anonymized text; re-apply the name rules and regexes anyway
+                def redo(note=""):
+                    return summarize(out, (a.system or "") + note, a.max_tokens or 1500, a.strict, a.keep_own_money)
+                summ = redo()
+                if a.paraphrase:                     # policy v4: its numbers and dates must be in the text
+                    summ = verify_summary(summ, out, redo, extra)
+                out, c2 = regex_pass(reapply(summ), money=not a.keep_own_money, all_amounts=a.all_amounts)
+                extra["regex_pass_hits_summary"] = c2
+            elif a.paraphrase:                       # policy v4: the anonymized text only, then the nets again
+                out, c3 = regex_pass(reapply(paraphrase(out, extra)), money=not a.keep_own_money,
+                                     all_amounts=a.all_amounts)
+                extra["regex_pass_hits_paraphrase"] = c3
+            sys.stdout.write(out if out.endswith("\n") else out + "\n")
+        else:
+            msgs = ([{"role": "system", "content": a.system}] if a.system else []) + [{"role": "user", "content": text}]
+            schema = None
+            if a.schema:
+                try:
+                    schema = json.loads(a.schema)
+                except ValueError:
+                    raise LLMError("--schema is not valid JSON", 2)
+                a.json = True
+            out, finish = chat(msgs, max_tokens=a.max_tokens or 1024, temperature=a.temp, json_mode=a.json,
+                               schema=schema, timeout=a.timeout)
+            if a.json:
+                try:
+                    out = json.dumps(json.loads(out), ensure_ascii=False)
+                except ValueError:
+                    raise LLMError("the local LLM did not return valid JSON%s"
+                                   % (" (cut off: raise --max-tokens)" if finish == "length" else ""), 4)
+            print(out)
+            if finish == "length":
+                print("llm-local: note: answer cut off at --max-tokens", file=sys.stderr)
+    except LLMError as e:
+        die(str(e), e.code)
+    finally:
+        if a.stats:
+            checks = [s for s in STATS if s["step"] == "check"]
+            for s in [s for s in STATS if s["step"] != "check"]:
+                print("llm-local stats: " + json.dumps(s), file=sys.stderr)
+            if checks:
+                print("llm-local stats: " + json.dumps({"step": "check x%d" % len(checks),
+                      "wall_s": round(sum(s["wall_s"] for s in checks), 1),
+                      "prompt_tokens": sum(s["prompt_tokens"] or 0 for s in checks),
+                      "gen_tokens": sum(s["gen_tokens"] or 0 for s in checks)}), file=sys.stderr)
+            if CACHE_STATS:
+                extra["cache"] = {k: {"hits": v[0], "misses": v[1]} for k, v in CACHE_STATS.items()}
+            if extra:
+                print("llm-local stats: " + json.dumps(extra, ensure_ascii=False), file=sys.stderr)
+        if os.environ.get("LLM_LOCAL_STATS_FILE") and (STATS or CACHE_STATS):
+            write_stats_line(os.environ["LLM_LOCAL_STATS_FILE"])
+        if CACHE:
+            try:
+                CACHE.prune()
+            except OSError:
+                pass
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,5 @@
+# Firefly sync (vendor/firefly_sync, the owner's bank-export importer): openpyxl reads .xlsx bank statements.
+# Exact versions + sha256 (pip --require-hashes --no-deps, wheels only), both well over 2 weeks old when pinned
+# on 2026-10-13.
+openpyxl==3.1.5 --hash=sha256:5282c12b107bffeef825f4617dc029afaf41d0ea60823bbb665ef3079dc79de2
+et-xmlfile==2.0.0 --hash=sha256:7a91720bc756843502c3b7504c77b8fe44217c85c537d85037f0f536151b2caa

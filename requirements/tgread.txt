@@ -1,0 +1,9 @@
+# tgread venv (~/opt/tgread-venv): exact versions + sha256 (pip --require-hashes --no-deps), all >= 2 weeks old
+# when pinned on 2026-10-10. ~/bin/tgread refuses to run with any other Telethon version (TELETHON_PIN):
+# bumping Telethon = update this file + TELETHON_PIN, re-check the guard, run ~/opt/tgread-tests/run.sh.
+telethon==1.45.0 --hash=sha256:339e24c83aedc9f12cbe389264627edc49779e4289c535aa90aafc4ce62f7972 --hash=sha256:4cb7ae269b8ab9dad9fc490b859f0bc2f885121e990f5b20407b1faa0db2a1d9
+pyaes==1.6.1 --hash=sha256:02c1b1405c38d3c370b085fb952dd8bea3fadcee6411ad99f312cc129c536d8f
+rsa==4.9.1 --hash=sha256:68635866661c6836b8d39430f97a996acbd61bfa49406748ea243539fe239762 --hash=sha256:e7bdbfdb5497da4c07dfd35530e1a902659db6ff241e39d9953cad06ebd0ae75
+pyasn1==0.6.4 --hash=sha256:deda9277cfd454080ec40b207fb6df82206a3a2688735233cdcd8d3d565f088b --hash=sha256:9c447d8431c947fe4c8febc4ed9e760bc29011a5b01e5c74b67025bd9fb8ce81
+segno==1.6.6 --hash=sha256:28c7d081ed0cf935e0411293a465efd4d500704072cdb039778a2ab8736190c7 --hash=sha256:e60933afc4b52137d323a4434c8340e0ce1e58cec71439e46680d4db188f11b3
+tzdata==2026.4 --hash=sha256:c2169a8b0a7a5e9674da5a135ccdfb2b3e671b333ed9fed17b41f73c34476e81 --hash=sha256:f1b8bd365d8d210c55353f4d7f8d6d8561c0ba50d704b700d195a9424bba0d79

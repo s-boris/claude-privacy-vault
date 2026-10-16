@@ -1,0 +1,1478 @@
+#!/usr/bin/env python3
+"""bills: the owner's bill tracker (Swiss QR-bills, eBill, invoices) with automatic Telegram reminders.
+
+  bills add --payee P --amount 123.45 [--currency CHF] --due YYYY-MM-DD [--ref REF] [--iban IBAN]
+            [--paperless ID] [--source gmail|photo|pdf|paperless|manual] [--source-id ID] [--note TEXT] [--no-remind]
+  bills paid ID|PAYEE [--date YYYY-MM-DD]     mark paid, cancel its pending reminders
+  bills list [--open|--all|--week] [--json]   default --open; --week = due within 7 days + overdue
+  bills week                                  "to pay this week" text for Telegram; prints nothing if nothing
+  bills show ID [--json]
+  bills edit ID [--payee ..] [--amount ..] [--currency ..] [--due ..] [--ref ..] [--iban ..] [--paperless ..] [--note ..]
+  bills remove ID                             delete the bill and its pending reminders
+  bills extract FILE [--text-chars N]         PDF/image → JSON (Swiss QR code, PDF text layer, due-date regex)
+  bills from-paperless ID                     the same JSON for a paperless document: through the privacy vault's
+                                              tier-1 fields when VAULT_MODE is on (amount, currency, due date, payee,
+                                              qr_bill, has_payment_ref; IBAN/reference are tier 2 and stay in the
+                                              vault: he pays from the QR code, never ask for them), else download +
+                                              extract
+  bills gmail-state [--done] [--seen MSGID ...]   bill-scout bookkeeping (scan window, seen message ids)
+  bills scan-paperless [--since YYYY-MM-DD] [--dry-run] [--json] [-v] [--cron] [--filed ID,ID]
+                                              new paperless documents → likely bills (QR code / bill words + the
+                                              vault's tier-1 fields + has_payment_ref) → `bills add --source
+                                              paperless` (no IBAN/reference: tier 2); uncertain ones listed "to check".
+                                              Read-only on paperless. --cron: ~/inbox note only when bills were added
+                                              (--filed: the doc ids the owner just filed via the vault bot, passed by
+                                              vault-events; then the note also comes when one of them needs checking)
+
+add: deduplicates (same amount + due, and the same reference, or the same payee with one reference empty;
+     a duplicate only fills in missing fields). Owner reminders (`remind add --owner --tag bill:ID`) at
+     09:00 three days before the due date and on the due date, skipping times already past.
+State: ~/.local/state/bills/ (bills.json, gmail-scan.json, paperless-scan.json). Tests: BILLS_STATE_DIR, BILLS_REMIND (remind
+command), BILLS_NOW ("YYYY-MM-DD HH:MM"), BILLS_PAPERLESS (paperless command), BILLS_INBOX, and REMIND_DB so
+no real owner reminder is created. scan-paperless tests: ~/opt/bills-tests/test_scan_paperless.py.
+"""
+import argparse, fcntl, json, os, re, shlex, shutil, subprocess, sys, tempfile
+import xml.etree.ElementTree as ET
+from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+try:
+    import assistant_profile  # noqa: E402
+except ImportError:  # vendored copy (e.g. inside the vault) has no bin/lib
+    class assistant_profile:  # minimal stand-in: profile keys fall back to env, then a neutral default
+        @staticmethod
+        def get(key, default=None):
+            return os.environ.get("ASSISTANT_" + key.upper().replace(".", "_"), default or "localhost")
+
+STATE = os.environ.get("BILLS_STATE_DIR") or os.path.expanduser("~/.local/state/bills")
+DB = os.path.join(STATE, "bills.json")
+GMAIL = os.path.join(STATE, "gmail-scan.json")
+REMIND = os.environ.get("BILLS_REMIND") or os.path.expanduser("~/bin/remind")
+REMIND_HOUR = "09:00"
+SOURCES = ("gmail", "photo", "pdf", "paperless", "manual")
+
+
+def now():
+    n = os.environ.get("BILLS_NOW")
+    return datetime.strptime(n, "%Y-%m-%d %H:%M") if n else datetime.now()
+
+
+def today():
+    return now().date()
+
+
+def die(msg, code=1):
+    print(f"bills: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------- normalizing / validating
+
+def parse_amount(s):
+    """'1'234.50', '1 234,50', '59.–', 'CHF 59.90' -> Decimal('1234.50')."""
+    t = str(s).strip().upper().replace("CHF", "").replace("EUR", "").replace("FR.", "").strip()
+    t = re.sub(r"[.,][–-]+$", ".00", t)
+    t = t.replace("'", "").replace("’", "").replace(" ", "").replace(" ", "")
+    if "," in t and "." not in t:
+        t = t.replace(",", ".")
+    elif "," in t:
+        t = t.replace(",", "")
+    try:
+        d = Decimal(t).quantize(Decimal("0.01"))
+    except InvalidOperation:
+        raise ValueError(f"not an amount: {s!r}")
+    if d <= 0:
+        raise ValueError(f"amount must be positive: {s!r}")
+    return d
+
+
+def parse_day(s):
+    s = s.strip()
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            pass
+    raise ValueError(f"not a date (want YYYY-MM-DD): {s!r}")
+
+
+def norm_ref(s):
+    return re.sub(r"\s+", "", s or "").upper()
+
+
+def norm_iban(s):
+    return re.sub(r"\s+", "", s or "").upper()
+
+
+def norm_payee(s):
+    return re.sub(r"[^0-9a-zäöüéèàç]+", "", (s or "").lower())
+
+
+def iban_ok(iban):
+    iban = norm_iban(iban)
+    if not re.fullmatch(r"[A-Z]{2}\d{2}[A-Z0-9]{8,30}", iban):
+        return False
+    if iban[:2] in ("CH", "LI") and len(iban) != 21:
+        return False
+    n = "".join(str(int(c, 36)) for c in iban[4:] + iban[:4])
+    return int(n) % 97 == 1
+
+
+def qr_iban(iban):
+    """QR-IBAN: CH/LI with an institution id 30000-31999 (only valid with a QRR reference)."""
+    iban = norm_iban(iban)
+    return iban[:2] in ("CH", "LI") and iban[4:9].isdigit() and 30000 <= int(iban[4:9]) <= 31999
+
+
+def qrr_ok(ref):
+    """27-digit QR reference (ex-ESR), recursive mod 10 check digit."""
+    ref = norm_ref(ref)
+    if not re.fullmatch(r"\d{27}", ref):
+        return False
+    table = [0, 9, 4, 6, 8, 2, 7, 1, 3, 5]
+    carry = 0
+    for c in ref[:-1]:
+        carry = table[(carry + int(c)) % 10]
+    return (10 - carry) % 10 == int(ref[-1])
+
+
+def scor_ok(ref):
+    """ISO 11649 creditor reference RFxx..."""
+    ref = norm_ref(ref)
+    if not re.fullmatch(r"RF\d{2}[A-Z0-9]{1,21}", ref):
+        return False
+    n = "".join(str(int(c, 36)) for c in ref[4:] + ref[:4])
+    return int(n) % 97 == 1
+
+
+def ref_type(ref):
+    ref = norm_ref(ref)
+    if not ref:
+        return "NON"
+    if qrr_ok(ref):
+        return "QRR"
+    if scor_ok(ref):
+        return "SCOR"
+    return "other"
+
+
+def fmt_ref(ref):
+    ref = norm_ref(ref)
+    if re.fullmatch(r"\d{27}", ref):
+        return ref[:2] + " " + " ".join(ref[i:i + 5] for i in range(2, 27, 5))
+    if ref.startswith("RF"):
+        return " ".join(ref[i:i + 4] for i in range(0, len(ref), 4))
+    return ref
+
+
+def fmt_iban(iban):
+    iban = norm_iban(iban)
+    return " ".join(iban[i:i + 4] for i in range(0, len(iban), 4))
+
+
+def fmt_amount(cur, amt):
+    a = Decimal(amt)
+    return f"{cur} {a:,.2f}".replace(",", "'")
+
+
+def fmt_day(d, weekday=True):
+    d = d if isinstance(d, date) else parse_day(d)
+    s = d.strftime("%d.%m") if d.year == today().year else d.strftime("%d.%m.%Y")
+    return (d.strftime("%a ") + s) if weekday else s
+
+
+# ---------------------------------------------------------------- state
+
+class Locked:
+    def __init__(self, path):
+        self.path = path
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self.fd = os.open(self.path + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        os.close(self.fd)
+
+
+def load():
+    try:
+        with open(DB) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"next_id": 1, "bills": []}
+    except json.JSONDecodeError as e:
+        die(f"{DB} is corrupt ({e}); not touching it")
+
+
+def save(st):
+    os.makedirs(STATE, exist_ok=True)
+    tmp = DB + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f, indent=1, ensure_ascii=False)
+    os.replace(tmp, DB)
+
+
+def find(st, key, open_only=False):
+    """A bill by id ('3' or '#3') or, for text, a unique payee substring among open bills."""
+    k = str(key).strip().lstrip("#")
+    if k.isdigit():
+        for b in st["bills"]:
+            if b["id"] == int(k):
+                return b
+        die(f"no bill #{k}")
+    hits = [b for b in st["bills"] if norm_payee(k) in norm_payee(b["payee"])
+            and (b["status"] == "open" or not open_only)]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        die(f"no {'open ' if open_only else ''}bill matching '{key}'")
+    die(f"'{key}' matches several bills, use the id:\n" + "\n".join(line(b) for b in hits))
+
+
+# ---------------------------------------------------------------- reminders
+
+def reminder_plan(b):
+    """(when, text) pairs: due-3d 09:00 and due-day 09:00, only those still in the future."""
+    due = parse_day(b["due"])
+    what = f"{b['payee']} {fmt_amount(b['currency'], b['amount'])}"
+    plan = [(due - timedelta(days=3), f"💸 Bill due in 3 days ({fmt_day(due)}): {what} (#{b['id']}). Already paid? Just tell me."),
+            (due, f"💸 Bill due today: {what} (#{b['id']}). Already paid? Just tell me.")]
+    out = []
+    for d, text in plan:
+        when = datetime.strptime(f"{d.isoformat()} {REMIND_HOUR}", "%Y-%m-%d %H:%M")
+        if when > now():
+            out.append((when, text))
+    return out
+
+
+def schedule(b):
+    b["reminders"] = []
+    errors = []
+    for when, text in reminder_plan(b):
+        at = when.strftime("%Y-%m-%d %H:%M")
+        r = subprocess.run([REMIND, "add", "--owner", "--tag", f"bill:{b['id']}", at, text],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            b["reminders"].append({"at": at, "text": text})
+        else:
+            errors.append(f"remind add {at} failed: {(r.stderr or r.stdout).strip()[:200]}")
+    return errors
+
+
+def unschedule(b):
+    r = subprocess.run([REMIND, "cancel", "--tag", f"bill:{b['id']}"], capture_output=True, text=True)
+    if r.returncode != 0:
+        return -1
+    return sum(1 for l in r.stdout.splitlines() if l.startswith("cancelled:"))
+
+
+def pending_reminders(b):
+    n = now().strftime("%Y-%m-%d %H:%M")
+    return [r for r in b.get("reminders", []) if r["at"] > n]
+
+
+# ---------------------------------------------------------------- output
+
+def when_txt(b):
+    if b["status"] == "paid":
+        return f"paid {fmt_day(b['paid_on'], False)}" if b.get("paid_on") else "paid"
+    d = (parse_day(b["due"]) - today()).days
+    if d < 0:
+        return f"OVERDUE {-d}d"
+    return "due today" if d == 0 else f"in {d}d"
+
+
+def line(b):
+    extra = []
+    if b.get("ref"):
+        extra.append(f"ref {fmt_ref(b['ref'])}")
+    if b.get("paperless"):
+        extra.append(f"paperless {b['paperless']}")
+    tail = f"  [{', '.join(extra)}]" if extra else ""
+    return (f"#{b['id']:<3} {fmt_day(b['due']):<12} {fmt_amount(b['currency'], b['amount']):>14}  "
+            f"{b['payee'][:32]:<32}  {when_txt(b)}{tail}")
+
+
+def totals(bills):
+    t = {}
+    for b in bills:
+        t[b["currency"]] = t.get(b["currency"], Decimal(0)) + Decimal(b["amount"])
+    return ", ".join(fmt_amount(c, a) for c, a in sorted(t.items()))
+
+
+def week_bills(st):
+    horizon = today() + timedelta(days=7)
+    return sorted((b for b in st["bills"] if b["status"] == "open" and parse_day(b["due"]) <= horizon),
+                  key=lambda b: b["due"])
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_add(a):
+    try:
+        amount = parse_amount(a.amount)
+        due = parse_day(a.due)
+    except ValueError as e:
+        die(str(e), 2)
+    cur = a.currency.strip().upper()
+    if not re.fullmatch(r"[A-Z]{3}", cur):
+        die(f"bad currency {a.currency!r}", 2)
+    payee = " ".join(a.payee.split())
+    if not payee:
+        die("empty payee", 2)
+    ref, iban = norm_ref(a.ref), norm_iban(a.iban)
+    warn = []
+    if iban and not iban_ok(iban):
+        warn.append(f"IBAN {iban} fails its checksum, check it")
+    if ref and re.fullmatch(r"\d{27}", ref) and not qrr_ok(ref):
+        warn.append("27-digit reference fails its check digit, check it")
+    if ref.startswith("RF") and not scor_ok(ref):
+        warn.append("RF reference fails its checksum, check it")
+    if due < today():
+        warn.append(f"due date {due} is already past (overdue)")
+    for w in warn:
+        print(f"warning: {w}", file=sys.stderr)
+
+    with Locked(DB):
+        st = load()
+        for b in st["bills"]:
+            same_core = Decimal(b["amount"]) == amount and b["due"] == due.isoformat() and b["currency"] == cur
+            same_ref = bool(ref) and norm_ref(b.get("ref")) == ref
+            same_payee = norm_payee(b["payee"]) == norm_payee(payee)
+            loose_ref = not ref or not b.get("ref") or norm_ref(b.get("ref")) == ref
+            same_src = bool(a.source_id) and b.get("source_id") == a.source_id
+            if (same_core and (same_ref or (same_payee and loose_ref))) or same_src:
+                filled = []
+                for k, v in (("ref", ref), ("iban", iban), ("paperless", a.paperless), ("source_id", a.source_id)):
+                    if v and not b.get(k):
+                        b[k] = v
+                        filled.append(k)
+                if a.note and a.note not in (b.get("note") or ""):
+                    b["note"] = ((b.get("note") or "") + " | " + a.note).strip(" |")
+                    filled.append("note")
+                if filled:
+                    save(st)
+                print(f"exists #{b['id']}: {b['payee']} {fmt_amount(b['currency'], b['amount'])}, due "
+                      f"{fmt_day(b['due'])} ({b['status']})" + (f"; filled in {', '.join(filled)}" if filled else ""))
+                return 0
+        b = {"id": st["next_id"], "payee": payee, "amount": str(amount), "currency": cur,
+             "due": due.isoformat(), "ref": ref or None, "iban": iban or None, "paperless": a.paperless,
+             "source": a.source, "source_id": a.source_id, "note": a.note or None, "status": "open",
+             "paid_on": None, "added": now().strftime("%Y-%m-%d %H:%M"), "reminders": []}
+        st["next_id"] += 1
+        st["bills"].append(b)
+        save(st)
+        errors = [] if a.no_remind else schedule(b)
+        save(st)
+    rem = ", ".join(f"{fmt_day(r['at'][:10])} {r['at'][11:]}" for r in b["reminders"])
+    if a.no_remind:
+        rem_txt = "no reminders (--no-remind)"
+    elif rem:
+        rem_txt = f"reminders {rem}"
+    else:
+        rem_txt = "no reminders (due date too close or past)"
+    print(f"added #{b['id']}: {payee} {fmt_amount(cur, amount)}, due {fmt_day(due)} → {rem_txt}")
+    for e in errors:
+        print(f"warning: {e}", file=sys.stderr)
+    return 3 if errors else 0
+
+
+def cmd_paid(a):
+    try:
+        on = parse_day(a.date) if a.date else today()
+    except ValueError as e:
+        die(str(e), 2)
+    with Locked(DB):
+        st = load()
+        b = find(st, a.bill, open_only=not str(a.bill).lstrip("#").isdigit())
+        if b["status"] == "paid":
+            print(f"#{b['id']} {b['payee']} was already marked paid ({b.get('paid_on')})")
+            return 0
+        n = unschedule(b)
+        b["status"], b["paid_on"] = "paid", on.isoformat()
+        save(st)
+    cancelled = "could not cancel reminders, check `remind list`" if n < 0 else \
+        f"cancelled {n} reminder{'s' if n != 1 else ''}"
+    print(f"paid #{b['id']}: {b['payee']} {fmt_amount(b['currency'], b['amount'])} (paid {fmt_day(on)}); {cancelled}")
+    return 0 if n >= 0 else 3
+
+
+def cmd_list(a):
+    st = load()
+    if a.week:
+        bills = week_bills(st)
+    elif a.all:
+        bills = sorted(st["bills"], key=lambda b: (b["status"] != "open", b["due"]))
+    else:
+        bills = sorted((b for b in st["bills"] if b["status"] == "open"), key=lambda b: b["due"])
+    if a.json:
+        print(json.dumps(bills, indent=1, ensure_ascii=False))
+        return 0
+    if not bills:
+        print("(no bills)" if a.all else "(no open bills)")
+        return 0
+    for b in bills:
+        print(line(b))
+    opn = [b for b in bills if b["status"] == "open"]
+    if opn:
+        print(f"open: {len(opn)} bill{'s' if len(opn) != 1 else ''}, {totals(opn)}")
+    return 0
+
+
+def cmd_week(a):
+    bills = week_bills(load())
+    if not bills:
+        return 0
+    out = ["💸 Bills to pay this week:"]
+    for b in bills:
+        d = parse_day(b["due"])
+        what = f"{b['payee']}: {fmt_amount(b['currency'], b['amount'])}"
+        if d < today():
+            out.append(f"• ⚠️ {what}, OVERDUE since {fmt_day(d)} (#{b['id']})")
+        elif d == today():
+            out.append(f"• {what}, due TODAY (#{b['id']})")
+        else:
+            out.append(f"• {what}, due {fmt_day(d)} (#{b['id']})")
+    if len(bills) > 1:
+        out.append(f"Total: {totals(bills)}")
+    print("\n".join(out))
+    return 0
+
+
+def cmd_show(a):
+    b = find(load(), a.bill)
+    if a.json:
+        print(json.dumps(b, indent=1, ensure_ascii=False))
+        return 0
+    print(f"#{b['id']}  {b['payee']}")
+    print(f"  amount:    {fmt_amount(b['currency'], b['amount'])}")
+    print(f"  due:       {fmt_day(b['due'])} {parse_day(b['due']).year}  ({when_txt(b)})")
+    print(f"  status:    {b['status']}" + (f" on {b['paid_on']}" if b.get("paid_on") else ""))
+    if b.get("ref"):
+        print(f"  reference: {fmt_ref(b['ref'])}  ({ref_type(b['ref'])})")
+    if b.get("iban"):
+        print(f"  IBAN:      {fmt_iban(b['iban'])}" + ("  (QR-IBAN)" if qr_iban(b["iban"]) else ""))
+    if b.get("paperless"):
+        print(f"  paperless: {b['paperless']}  http://{assistant_profile.get('network.server_host')}:8000/documents/{b['paperless']}/details")
+    print(f"  source:    {b.get('source')}" + (f" ({b['source_id']})" if b.get("source_id") else "")
+          + f", added {b.get('added')}")
+    if b.get("note"):
+        print(f"  note:      {b['note']}")
+    pend = pending_reminders(b)
+    for r in b.get("reminders", []):
+        state = "pending" if r in pend and b["status"] == "open" else ("sent" if r not in pend else "cancelled")
+        print(f"  reminder:  {r['at']} ({state})")
+    return 0
+
+
+def cmd_edit(a):
+    with Locked(DB):
+        st = load()
+        b = find(st, a.bill)
+        changed = []
+        try:
+            if a.payee is not None:
+                b["payee"] = " ".join(a.payee.split()); changed.append("payee")
+            if a.amount is not None:
+                b["amount"] = str(parse_amount(a.amount)); changed.append("amount")
+            if a.currency is not None:
+                b["currency"] = a.currency.strip().upper(); changed.append("currency")
+            if a.due is not None:
+                b["due"] = parse_day(a.due).isoformat(); changed.append("due")
+        except ValueError as e:
+            die(str(e), 2)
+        if a.ref is not None:
+            b["ref"] = norm_ref(a.ref) or None; changed.append("ref")
+        if a.iban is not None:
+            b["iban"] = norm_iban(a.iban) or None; changed.append("iban")
+        if a.paperless is not None:
+            b["paperless"] = a.paperless or None; changed.append("paperless")
+        if a.note is not None:
+            b["note"] = a.note or None; changed.append("note")
+        if not changed:
+            die("nothing to change", 2)
+        msg = ""
+        if b["status"] == "open" and set(changed) & {"payee", "amount", "currency", "due"}:
+            unschedule(b)
+            errors = schedule(b)
+            msg = "; reminders " + (", ".join(f"{fmt_day(r['at'][:10])} {r['at'][11:]}" for r in b["reminders"]) or "none (too close)")
+            for e in errors:
+                print(f"warning: {e}", file=sys.stderr)
+        save(st)
+    print(f"updated #{b['id']} ({', '.join(changed)}): {b['payee']} {fmt_amount(b['currency'], b['amount'])}, "
+          f"due {fmt_day(b['due'])}{msg}")
+    return 0
+
+
+def cmd_remove(a):
+    with Locked(DB):
+        st = load()
+        b = find(st, a.bill)
+        n = unschedule(b)
+        st["bills"] = [x for x in st["bills"] if x["id"] != b["id"]]
+        save(st)
+    print(f"removed #{b['id']}: {b['payee']} {fmt_amount(b['currency'], b['amount'])}, due {fmt_day(b['due'])}"
+          + (f"; cancelled {n} reminder{'s' if n != 1 else ''}" if n > 0 else ""))
+    return 0
+
+
+def cmd_gmail_state(a):
+    with Locked(GMAIL):
+        try:
+            with open(GMAIL) as f:
+                g = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            g = {"last_scan": None, "seen": []}
+        if a.done or a.seen:
+            for m in a.seen or []:
+                if m not in g["seen"]:
+                    g["seen"].append(m)
+            g["seen"] = g["seen"][-1000:]
+            if a.done:
+                g["last_scan"] = now().strftime("%Y-%m-%d %H:%M")
+            os.makedirs(STATE, exist_ok=True)
+            with open(GMAIL + ".tmp", "w") as f:
+                json.dump(g, f, indent=1)
+            os.replace(GMAIL + ".tmp", GMAIL)
+            print(f"recorded: last_scan={g['last_scan']}, {len(g['seen'])} seen ids")
+            return 0
+    first = not g.get("last_scan")
+    since = today() - timedelta(days=60) if first else parse_day(g["last_scan"][:10]) - timedelta(days=2)
+    print(json.dumps({"first_run": first, "last_scan": g.get("last_scan"),
+                      "after": since.strftime("%Y/%m/%d"), "seen": g.get("seen", [])[-300:]}, indent=1))
+    return 0
+
+
+# ================================================================ extraction (offline)
+#
+# 1. PDF text layer (pdftotext -layout)   2. Swiss QR code (pdftoppm → zbarimg, or zbarimg on the image),
+# parsed as a Swiss Payments Code "SPC" payload   3. regexes on the text for due date / invoice date and,
+# without a QR code, IBAN / amount / reference   4. otherwise: needs_review + the text for Claude to read.
+
+MONTHS = {}
+for i, names in enumerate([
+        "januar jan january janvier gennaio", "februar feb february février fevrier febbraio",
+        "märz mär maerz mar march mars marzo", "april apr avril aprile", "mai may maggio",
+        "juni jun june juin giugno", "juli jul july juillet luglio", "august aug août aout agosto",
+        "september sept sep septembre settembre", "oktober okt oct october octobre ottobre",
+        "november nov novembre", "dezember dez dec december décembre decembre dicembre"], 1):
+    for n in names.split():
+        MONTHS[n] = i
+MONTH_RE = "|".join(sorted(map(re.escape, MONTHS), key=len, reverse=True))
+
+DATE_RE = re.compile(
+    r"(?P<iso>(?P<iy>20\d\d)-(?P<im>[01]?\d)-(?P<id>[0-3]?\d))"
+    r"|(?P<dot>(?P<dd>[0-3]?\d)\s?[./]\s?(?P<dm>[01]?\d)\s?[./]\s?(?P<dy>20\d\d|\d\d)(?!\d))"
+    r"|(?P<long>(?P<ld>[0-3]?\d)\.?\s*(?:de\s+)?(?P<lm>" + MONTH_RE + r")\.?\s+(?P<ly>20\d\d))"
+    r"|(?P<us>(?P<um>" + MONTH_RE + r")\.?\s+(?P<ud>[0-3]?\d)(?:st|nd|rd|th)?,?\s+(?P<uy>20\d\d))",
+    re.I)
+
+DUE_KEYS = re.compile(
+    r"zahlbar\s+(?:bis|am)|fällig(?:keit)?(?:\s*(?:am|bis|per|datum|keitsdatum))?|faelligkeit|"
+    r"zahlungs(?:frist|termin|ziel)|verfall(?:datum|tag)?|"
+    r"(?:bezahlen|überweisen|ueberweisen|begleichen|einzahlen)\s+(?:sie\s+)?(?:den\s+\w*betrag\s+)?(?:bitte\s+)?bis|"
+    r"zu\s+(?:be)?zahlen\s+bis|bis\s+spätestens|spätestens\s+(?:am|bis)|"
+    r"due\s+(?:date|by|on)|payable\s+(?:by|until|on|before)|payment\s+due|pay\s+by|\bdue\s*:|"
+    r"payable\s+jusqu|à\s+payer\s+jusqu|échéance|echeance|pagabile\s+entro|da\s+pagare\s+entro|scadenza",
+    re.I)
+INVDATE_KEYS = re.compile(
+    r"rechnungsdatum|rechnungs-datum|invoice\s+date|date\s+of\s+invoice|datum\s+der\s+rechnung|"
+    r"date\s+de\s+(?:la\s+)?facture|data\s+(?:della\s+)?fattura|ausstellungsdatum|\bdatum\b|\bdate\b", re.I)
+RELATIVE_RE = re.compile(
+    r"(?:zahlbar|payable|zahlung|payment|bezahlen|due|netto|net|zahlungsziel|zahlungsfrist|payable)"
+    r"[^\n.]{0,30}?(?:innert|innerhalb(?:\s+von)?|within|in|entro|dans\s+les)?\s+(\d{1,3})\s*"
+    r"(?:tagen|tage|days|day|jours|giorni)", re.I)
+
+AMOUNT_RE = re.compile(r"(?<![\d.,'’])(\d{1,3}(?:['’  ]\d{3})+|\d+)[.,](\d\d|[–-]{1,2})(?!\d|[.,]\d)")
+AMOUNT_KEYS = re.compile(
+    r"total|betrag|amount|zu\s+(?:be)?zahlen|zahlbetrag|summe|montant|importo|balance\s+due|"
+    r"to\s+pay|rechnungstotal|endbetrag|saldo", re.I)
+STRONG_AMOUNT_KEYS = re.compile(
+    r"rechnungsbetrag|gesamtbetrag|totalbetrag|zahlbetrag|zu\s+(?:be)?zahlen|amount\s+due|total\s+due|"
+    r"balance\s+due|endbetrag|rechnungstotal|total\s+(?:chf|eur|inkl|incl)|total\b", re.I)
+CUR_RE = re.compile(r"\b(CHF|EUR|USD|GBP|SFr\.?|Fr\.)", re.I)
+IBAN_RE = re.compile(r"\b([A-Z]{2}\d{2}(?:[  ]?[A-Z0-9]{4}){2,7}(?:[  ]?[A-Z0-9]{1,3})?)\b")
+QRR_RE = re.compile(r"(?<!\d)(\d{2}(?:[  ]?\d{5}){5})(?!\d)")
+SCOR_RE = re.compile(r"\b(RF\d{2}(?:[  ]?[A-Z0-9]{1,4}){1,6})\b")
+
+
+def _date_from_match(m):
+    try:
+        if m.group("iso"):
+            return date(int(m["iy"]), int(m["im"]), int(m["id"]))
+        if m.group("dot"):
+            y = int(m["dy"])
+            return date(y + 2000 if y < 100 else y, int(m["dm"]), int(m["dd"]))
+        if m.group("long"):
+            return date(int(m["ly"]), MONTHS[m["lm"].lower()], int(m["ld"]))
+        if m.group("us"):
+            return date(int(m["uy"]), MONTHS[m["um"].lower()], int(m["ud"]))
+    except (ValueError, KeyError):
+        return None
+
+
+def find_dates(s):
+    out = []
+    for m in DATE_RE.finditer(s):
+        d = _date_from_match(m)
+        if d:
+            out.append((m.start(), d, m.group(0)))
+    return out
+
+
+def _window_after(text, pos, chars=90):
+    """The text right after a keyword: the rest of its line plus the next line (layout tables)."""
+    end = text.find("\n", pos)
+    end = len(text) if end < 0 else end
+    nxt = text.find("\n", end + 1)
+    nxt = len(text) if nxt < 0 else nxt
+    rest = text[pos:end][:chars]
+    return rest, text[end + 1:nxt][:chars]
+
+
+def _keyword_dates(text, keys):
+    hits = []
+    for k in keys.finditer(text):
+        rest, nxt = _window_after(text, k.end())
+        ds = find_dates(rest)
+        if not ds:
+            # a label in one column, its value under it in the next line
+            col = k.start() - (text.rfind("\n", 0, k.start()) + 1)
+            ds = [x for x in find_dates(nxt) if abs(x[0] - col) < 40] or (find_dates(nxt)[:1] if not rest.strip() else [])
+        if ds:
+            hits.append((k.group(0).strip(), ds[0][1], ds[0][2]))
+    return hits
+
+
+def due_from_text(text, invoice_date=None):
+    """(due_date|None, source description, candidates[])."""
+    lo, hi = today() - timedelta(days=400), today() + timedelta(days=400)
+    hits = [h for h in _keyword_dates(text, DUE_KEYS) if lo <= h[1] <= hi]
+    cands = sorted({h[1] for h in hits})
+    if len(cands) == 1:
+        h = hits[0]
+        return cands[0], f"text: '{h[0]} … {h[2]}'", [c.isoformat() for c in cands]
+    if len(cands) > 1:
+        return None, "conflicting dates near due-date words", [c.isoformat() for c in cands]
+    m = RELATIVE_RE.search(text)
+    if m and invoice_date:
+        n = int(m.group(1))
+        if 0 < n <= 120:
+            return invoice_date + timedelta(days=n), f"derived: invoice date + {n} days ('{m.group(0).strip()}')", []
+    if m:
+        return None, f"relative term '{m.group(0).strip()}' but no invoice date found", []
+    return None, None, []
+
+
+def invoice_date_from_text(text):
+    due_dates = {h[1] for h in _keyword_dates(text, DUE_KEYS)}
+    hits = [h for h in _keyword_dates(text, INVDATE_KEYS) if h[1] not in due_dates]
+    lo, hi = today() - timedelta(days=400), today() + timedelta(days=5)
+    for k, d, raw in hits:
+        if lo <= d <= hi and k.lower() not in ("datum", "date"):
+            return d
+    for k, d, raw in hits:
+        if lo <= d <= hi:
+            return d
+    # a letter date like "<town>, 1. Oktober 2026" in the first lines
+    for _, d, _ in find_dates("\n".join(text.splitlines()[:25])):
+        if lo <= d <= hi and d not in due_dates:
+            return d
+    return None
+
+
+def amount_from_text(text):
+    """(Decimal|None, currency|None, confidence)."""
+    lines = text.splitlines()
+    cands = []
+    for i, ln in enumerate(lines):
+        prev = lines[i - 1] if i else ""
+        for m in AMOUNT_RE.finditer(ln):
+            try:
+                val = parse_amount(m.group(0))
+            except ValueError:
+                continue
+            near = ln[max(0, m.start() - 40):m.end() + 8]
+            cur = CUR_RE.search(near) or CUR_RE.search(prev)
+            score = 0
+            if STRONG_AMOUNT_KEYS.search(ln) or STRONG_AMOUNT_KEYS.search(prev):
+                score += 3
+            elif AMOUNT_KEYS.search(ln) or AMOUNT_KEYS.search(prev):
+                score += 2
+            if cur:
+                score += 1
+            if re.search(r"mwst|mehrwertsteuer|vat|tva|iva|rabatt|discount|skonto|%", ln, re.I):
+                score -= 2
+            cands.append((score, val, (cur.group(1) if cur else None)))
+    cands = [c for c in cands if c[0] >= 2]
+    if not cands:
+        return None, None, None
+    best = max(c[0] for c in cands)
+    top = [c for c in cands if c[0] == best]
+    vals = {c[1] for c in top}
+    val = max(vals)
+    cur = next((c[2] for c in top if c[1] == val and c[2]), None)
+    cur = {"SFR.": "CHF", "SFR": "CHF", "FR.": "CHF"}.get((cur or "").upper(), (cur or "").upper()) or None
+    return val, cur, ("medium" if len(vals) == 1 else "low")
+
+
+def iban_from_text(text):
+    found = []
+    for m in IBAN_RE.finditer(text):
+        raw = norm_iban(m.group(1))
+        # the regex may swallow a following word; try trimming down to a valid IBAN
+        for L in range(len(raw), 14, -1):
+            if iban_ok(raw[:L]):
+                if raw[:L] not in found:
+                    found.append(raw[:L])
+                break
+    return found
+
+
+def refs_from_text(text):
+    out = []
+    for m in QRR_RE.finditer(text):
+        r = norm_ref(m.group(1))
+        if qrr_ok(r) and r not in out:
+            out.append(r)
+    for m in SCOR_RE.finditer(text):
+        raw = norm_ref(m.group(1))
+        for L in range(len(raw), 4, -1):
+            if scor_ok(raw[:L]):
+                if raw[:L] not in out:
+                    out.append(raw[:L])
+                break
+    return out
+
+
+def parse_spc(payload):
+    """Swiss Payments Code (QR-bill, Implementation Guidelines 2.x, version 0200) → dict, or None."""
+    if not payload:
+        return None
+    lines = payload.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if lines[0].strip().lstrip("﻿") != "SPC" or len(lines) < 30:
+        return None
+    L = [x.strip() for x in lines] + [""] * 8
+
+    def addr(f):
+        t, name = f[0], f[1]
+        if t == "K":   # combined (deprecated since Nov 2025): line1, line2, country
+            parts = [f[2], f[3]]
+        else:          # structured: street, number, postcode, town
+            parts = [" ".join(x for x in (f[2], f[3]) if x), " ".join(x for x in (f[4], f[5]) if x)]
+        parts.append(f[6])
+        return {"name": name, "address": ", ".join(p for p in parts if p), "type": t}
+
+    d = {"version": L[1], "coding": L[2], "iban": norm_iban(L[3]), "creditor": addr(L[4:11]),
+         "ultimate_creditor": addr(L[11:18]) if L[12] else None,
+         "amount": L[18] or None, "currency": L[19], "debtor": addr(L[20:27]) if L[21] else None,
+         "reference_type": L[27], "reference": norm_ref(L[28]) or None, "message": L[29] or None,
+         "trailer": L[30], "bill_info": L[31] or None,
+         "alt_procedures": [x for x in L[32:34] if x], "warnings": []}
+    if d["trailer"] != "EPD":
+        d["warnings"].append(f"QR payload trailer is {d['trailer']!r}, not 'EPD' (unusual layout)")
+    if not d["version"].startswith("02"):
+        d["warnings"].append(f"QR version {d['version']} (expected 02xx)")
+    if d["iban"] and not iban_ok(d["iban"]):
+        d["warnings"].append("IBAN from QR code fails its checksum")
+    if d["reference_type"] == "QRR" and d["reference"] and not qrr_ok(d["reference"]):
+        d["warnings"].append("QR reference fails its check digit")
+    if d["reference_type"] == "SCOR" and d["reference"] and not scor_ok(d["reference"]):
+        d["warnings"].append("RF reference fails its checksum")
+    return d
+
+
+def swico_due(bill_info):
+    """Swico S1 bill information: /11/ invoice date (YYMMDD), /40/ terms 'disc:days;0:30' → net due date."""
+    if not bill_info or not bill_info.startswith("//S1/"):
+        return None, None
+    fields = {}
+    for m in re.finditer(r"/(\d\d)/((?:[^/\\]|\\.)*)", bill_info[4:]):
+        fields[m.group(1)] = m.group(2).replace("\\/", "/")
+    inv = None
+    if re.fullmatch(r"\d{6}", fields.get("11", "")[:6] or ""):
+        try:
+            inv = datetime.strptime(fields["11"][:6], "%y%m%d").date()
+        except ValueError:
+            inv = None
+    days = None
+    for term in fields.get("40", "").split(";"):
+        p = term.split(":")
+        if len(p) == 2 and p[1].strip().isdigit():
+            if p[0].strip() in ("0", "0.0", "0.00"):
+                days = int(p[1])
+    if inv and days is not None:
+        return inv + timedelta(days=days), inv
+    return None, inv
+
+
+def zbar_decode(img):
+    """All QR payloads zbarimg finds in an image (XML output keeps multi-line payloads intact)."""
+    if not shutil.which("zbarimg"):
+        return [], "zbarimg not installed (apt zbar-tools)"
+    try:
+        r = subprocess.run(["zbarimg", "--quiet", "--xml", "-Sdisable", "-Sqrcode.enable", img],
+                           capture_output=True, timeout=90)
+    except subprocess.TimeoutExpired:
+        return [], "zbarimg timed out"
+    if r.returncode not in (0, 4):   # 4 = no symbol found
+        return [], f"zbarimg failed: {r.stderr.decode(errors='replace').strip()[:200]}"
+    out = []
+    try:
+        root = ET.fromstring(r.stdout.decode("utf-8", errors="replace"))
+    except ET.ParseError:
+        return [], "zbarimg output unreadable"
+    for el in root.iter():
+        if el.tag.endswith("data") and el.text:
+            txt = el.text
+            if el.get("format") == "base64":
+                import base64
+                txt = base64.b64decode(txt).decode("utf-8", errors="replace")
+            if re.search(r"[\u3000-\u9fff\uac00-\ud7af]", txt):
+                # zbar guessed a CJK charset for UTF-8 bytes (e.g. "Müller" → "M羹ller"); undo it
+                for enc in ("big5", "shift_jis", "gb18030", "euc-kr"):
+                    try:
+                        fixed = txt.encode(enc).decode("utf-8")
+                    except (UnicodeEncodeError, UnicodeDecodeError):
+                        continue
+                    txt = fixed
+                    break
+            out.append(txt)
+    return out, None
+
+
+def file_kind(path):
+    with open(path, "rb") as f:
+        head = f.read(16)
+    if head.startswith(b"%PDF"):
+        return "pdf"
+    if head[:3] == b"\xff\xd8\xff" or head.startswith(b"\x89PNG") or head[:4] in (b"GIF8", b"II*\x00", b"MM\x00*") \
+            or (head[:4] == b"RIFF" and head[8:12] == b"WEBP") or head[4:12] in (b"ftypheic", b"ftypheix", b"ftypmif1"):
+        return "image"
+    return "unknown"
+
+
+def pdf_pages(path):
+    try:
+        r = subprocess.run(["pdfinfo", path], capture_output=True, text=True, timeout=30)
+        m = re.search(r"^Pages:\s+(\d+)", r.stdout, re.M)
+        return int(m.group(1)) if m else 1
+    except Exception:
+        return 1
+
+
+BLUR_PY = os.path.expanduser("~/opt/bills-venv/bin/python")   # has Pillow
+
+
+def blur_decode(img):
+    """Retry zbar on blurred copies of img (needs Pillow in ~/opt/bills-venv)."""
+    if not os.path.exists(BLUR_PY):
+        return []
+    out = []
+    for r in (1.5, 2.5, 3.5):
+        blurred = f"{img}.blur{r}.png"
+        try:
+            subprocess.run([BLUR_PY, "-c", "import sys; from PIL import Image, ImageFilter; "
+                            "Image.open(sys.argv[1]).filter(ImageFilter.GaussianBlur(float(sys.argv[3]))).save(sys.argv[2])",
+                            img, blurred, str(r)], capture_output=True, timeout=60, check=True)
+        except Exception:
+            continue
+        got, _ = zbar_decode(blurred)
+        out += got
+        if any(parse_spc(p) for p in got):
+            break
+    return out
+
+
+def extract(path, text_chars=4000):
+    res = {"file": os.path.abspath(path), "kind": None, "methods": [], "qr_found": False, "text_layer": False,
+           "payee": None, "payee_address": None, "payee_guess": None, "amount": None, "currency": None,
+           "reference": None, "reference_type": None, "iban": None, "due": None, "due_source": None,
+           "due_candidates": [], "invoice_date": None, "message": None, "bill_info": None, "debtor": None,
+           "confidence": {}, "warnings": [], "needs_review": True, "text": None, "suggested_add": None}
+    if not os.path.isfile(path):
+        res["warnings"].append("no such file")
+        return res
+    kind = res["kind"] = file_kind(path)
+    text, payloads = "", []
+    tmp = tempfile.mkdtemp(prefix="bills-extract-")
+    try:
+        if kind == "pdf":
+            if shutil.which("pdftotext"):
+                r = subprocess.run(["pdftotext", "-layout", "-l", "10", path, "-"], capture_output=True, timeout=60)
+                text = r.stdout.decode("utf-8", errors="replace")
+                res["text_layer"] = len(re.sub(r"\s+", "", text)) > 40
+                res["methods"].append("pdftotext")
+            else:
+                res["warnings"].append("pdftotext not installed (apt poppler-utils)")
+            if os.environ.get("BILLS_NO_QR"):     # tests: exercise the text-only path
+                pass
+            elif shutil.which("pdftoppm"):
+                n = pdf_pages(path)
+                pages = list(range(1, n + 1)) if n <= 6 else [1, 2, 3, n - 2, n - 1, n]
+                for dpi in (200, 300):
+                    for p in reversed(pages):   # the payment part is usually on the last page
+                        subprocess.run(["pdftoppm", "-r", str(dpi), "-png", "-gray", "-f", str(p), "-l", str(p),
+                                        path, os.path.join(tmp, f"p{dpi}-{p}")], capture_output=True, timeout=120)
+                    imgs = sorted(f for f in os.listdir(tmp) if f.startswith(f"p{dpi}-"))
+                    for f in imgs:
+                        got, err = zbar_decode(os.path.join(tmp, f))
+                        payloads += got
+                        if err and err not in res["warnings"]:
+                            res["warnings"].append(err)
+                    if any(parse_spc(p) for p in payloads):
+                        break
+                if not any(parse_spc(p) for p in payloads):
+                    # Vector-drawn QR codes render with hairline seams between modules that zbar can't read;
+                    # a Gaussian blur closes them (radius 2.5 at 300 dpi works).
+                    for f in sorted(x for x in os.listdir(tmp) if x.startswith("p300-")):
+                        got = blur_decode(os.path.join(tmp, f))
+                        payloads += got
+                        if any(parse_spc(p) for p in got):
+                            res["methods"].append("qr-blur")
+                            break
+                res["methods"].append("qr")
+            else:
+                res["warnings"].append("pdftoppm not installed (apt poppler-utils)")
+        elif kind == "image" and not os.environ.get("BILLS_NO_QR"):
+            got, err = zbar_decode(path)
+            payloads += got
+            res["methods"].append("qr")
+            if err:
+                res["warnings"].append(err)
+        else:
+            res["warnings"].append("not a PDF or image")
+            return res
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    spc = next((s for s in (parse_spc(p) for p in payloads) if s), None)
+    if payloads and not spc:
+        res["warnings"].append(f"{len(payloads)} QR code(s) found, none is a Swiss QR-bill")
+    if spc:
+        res["qr_found"] = True
+        res["payee"] = spc["creditor"]["name"] or None
+        res["payee_address"] = spc["creditor"]["address"] or None
+        res["iban"] = spc["iban"] or None
+        res["currency"] = spc["currency"] or None
+        if spc["amount"]:
+            try:
+                res["amount"] = str(parse_amount(spc["amount"]))
+            except ValueError:
+                res["warnings"].append(f"QR amount unreadable: {spc['amount']!r}")
+        else:
+            res["warnings"].append("QR-bill without amount (open amount): the amount must come from the text or the owner")
+        res["reference"] = spc["reference"]
+        res["reference_type"] = spc["reference_type"]
+        res["message"] = spc["message"]
+        res["bill_info"] = spc["bill_info"]
+        res["debtor"] = spc["debtor"]["name"] if spc["debtor"] else None
+        res["warnings"] += spc["warnings"]
+        for k in ("payee", "iban", "currency", "reference"):
+            if res[k]:
+                res["confidence"][k] = "high"
+        if res["amount"] is not None:
+            res["confidence"]["amount"] = "high"
+
+    # due date (and invoice date) from the text; Swico bill information as a fallback
+    inv = invoice_date_from_text(text) if text else None
+    sw_due, sw_inv = swico_due(res["bill_info"])
+    inv = inv or sw_inv
+    if inv:
+        res["invoice_date"] = inv.isoformat()
+    if text:
+        due, src, cands = due_from_text(text, inv)
+        res["due_candidates"] = cands
+        if due:
+            res["due"], res["due_source"] = due.isoformat(), src
+            res["confidence"]["due"] = "medium" if src.startswith("text") else "low"
+        elif src:
+            res["warnings"].append(f"due date unsure: {src}" + (f" {cands}" if cands else ""))
+    if not res["due"] and sw_due:
+        res["due"], res["due_source"] = sw_due.isoformat(), "derived: QR bill info (Swico /11/ invoice date + /40/ net days)"
+        res["confidence"]["due"] = "medium"
+
+    # without a QR code: IBAN, reference, amount and a payee guess from the text
+    if text and not spc:
+        ibans = iban_from_text(text)
+        if ibans:
+            res["iban"] = ibans[0]
+            res["confidence"]["iban"] = "medium" if len(ibans) == 1 else "low"
+            if len(ibans) > 1:
+                res["warnings"].append(f"several IBANs in the text: {ibans}")
+        refs = refs_from_text(text)
+        if refs:
+            res["reference"] = refs[0]
+            res["reference_type"] = ref_type(refs[0])
+            res["confidence"]["reference"] = "medium" if len(refs) == 1 else "low"
+        val, cur, conf = amount_from_text(text)
+        if val is not None:
+            res["amount"], res["confidence"]["amount"] = str(val), conf
+            res["currency"] = cur
+        if not res["currency"]:
+            m = CUR_RE.search(text)
+            if m:
+                c = m.group(1).upper()
+                res["currency"] = "CHF" if c.startswith(("SFR", "FR")) else c
+        # QR-bill payment part printed without a readable code: "Konto / Zahlbar an" → IBAN, then the name
+        m = re.search(r"(?:Konto\s*/\s*Zahlbar an|Account\s*/\s*Payable to|Compte\s*/\s*Payable à|Conto\s*/\s*Pagabile a)"
+                      r"[^\n]*\n[^\n]*\n\s*([^\n]+?)(?:\s{3,}|\n)", text, re.I)
+        LABEL = r"Konto\s*/\s*Zahlbar|Account\s*/\s*Payable|Compte\s*/\s*Payable|Conto\s*/\s*Pagabile|Zahlbar durch|Payable by"
+        if (not m or re.search(LABEL, m.group(1), re.I)) and kind == "pdf" and shutil.which("pdftotext"):
+            # -layout merges the receipt and payment columns; the plain text keeps them apart
+            raw = subprocess.run(["pdftotext", "-l", "10", path, "-"], capture_output=True, timeout=60).stdout.decode("utf-8", "replace")
+            m = re.search(r"(?:Konto\s*/\s*Zahlbar an|Account\s*/\s*Payable to|Compte\s*/\s*Payable à|Conto\s*/\s*Pagabile a)"
+                          r"\s*\n\s*(?:CH|LI)[\d ]{19,26}\s*\n\s*([^\n]+)", raw, re.I)
+        if m and not re.search(r"\d{4}", m.group(1)) and not re.search(LABEL, m.group(1), re.I):
+            res["payee"] = m.group(1).strip()
+            res["confidence"]["payee"] = "medium"
+        else:
+            first = next((l.strip() for l in text.splitlines() if len(l.strip()) > 2), None)
+            res["payee_guess"] = re.split(r"\s{3,}", first)[0] if first else None
+    if res["amount"] is None and text and spc:
+        val, cur, conf = amount_from_text(text)
+        if val is not None:
+            res["amount"], res["confidence"]["amount"] = str(val), "low"
+            res["warnings"].append("amount from the text, not the QR code: check it")
+
+    if res["iban"] and res["reference_type"] == "QRR" and not qr_iban(res["iban"]):
+        res["warnings"].append("QRR reference with a non-QR-IBAN: inconsistent, check it")
+
+    missing = [k for k in ("payee", "amount", "due") if not res[k]]
+    res["needs_review"] = bool(missing) or any(v == "low" for v in res["confidence"].values())
+    if missing:
+        res["warnings"].append("missing: " + ", ".join(missing) +
+                               (" (image: read it yourself)" if kind == "image" else ""))
+    if res["needs_review"] and text:
+        res["text"] = text.strip()[:text_chars]
+    if kind == "pdf" and not res["text_layer"]:
+        res["warnings"].append("PDF has no text layer (scan): read the page images yourself for the due date")
+
+    args = ["bills", "add", "--payee", res["payee"] or res["payee_guess"] or "?",
+            "--amount", res["amount"] or "?",
+            "--currency", res["currency"] or "CHF", "--due", res["due"] or "?"]
+    if res["reference"]:
+        args += ["--ref", res["reference"]]
+    if res["iban"]:
+        args += ["--iban", res["iban"]]
+    res["suggested_add"] = " ".join(shlex.quote(x) for x in args)
+    return res
+
+
+def cmd_extract(a):
+    print(json.dumps(extract(a.file, a.text_chars), indent=1, ensure_ascii=False))
+    return 0
+
+
+def vault_mode():
+    v = os.environ.get("VAULT_MODE")
+    if v is None:
+        try:
+            with open(os.path.expanduser("~/.config/vault/mode")) as f:
+                v = f.read()
+        except OSError:
+            v = ""
+    return v.strip().lower() in ("on", "1", "true", "yes")
+
+
+# Tier 1 only: IBAN, reference, payee address and payment message are tier 2 and need
+# the owner's ✅ per document. A bill doesn't need them: he pays from the QR code. has_payment_ref says a slip is there.
+VAULT_FIELDS = "amount,currency,due_date,payee,invoice_date,qr_bill,has_payment_ref,correspondent,title"
+
+
+def cmd_from_paperless(a):
+    """paperless document → extract-style JSON. Vault mode: the vault's whitelisted raw fields (no document text
+    enters this box); direct mode: `paperless download` + extract()."""
+    if vault_mode():
+        vault = os.environ.get("BILLS_VAULT") or os.path.expanduser("~/bin/vault")
+        r = subprocess.run([vault, "paperless", "fields", str(a.id), "--fields", VAULT_FIELDS],
+                           capture_output=True, text=True, timeout=3600)
+        if r.returncode != 0:
+            die(f"vault paperless fields {a.id} failed: {(r.stderr or r.stdout).strip()[:300]}")
+        f = json.loads(r.stdout)
+        res = {"source": f"paperless #{a.id} (privacy vault fields)", "qr_found": bool(f.get("qr_bill")),
+               "payee": f.get("payee") or f.get("correspondent"), "payee_address": f.get("payee_address"),
+               "amount": f.get("amount"), "currency": f.get("currency"), "reference": f.get("reference"),
+               "reference_type": f.get("reference_type"), "iban": f.get("iban"), "due": f.get("due_date"),
+               "invoice_date": f.get("invoice_date"), "message": f.get("payment_message"), "title": f.get("title"),
+               "has_payment_ref": bool(f.get("has_payment_ref") or f.get("iban") or f.get("reference")),
+               "confidence": f.get("_confidence") or {}, "warnings": f.get("_warnings") or [],
+               "privacy": "tier-1 fields only: IBAN/reference stay in the vault (he pays from the QR code; never "
+                          "ask him for them)"}
+    else:
+        paperless = os.environ.get("BILLS_PAPERLESS") or os.path.expanduser("~/bin/paperless")
+        d = tempfile.mkdtemp(prefix="bills-paperless-")
+        try:
+            r = subprocess.run([paperless, "download", str(a.id), d], capture_output=True, text=True, timeout=300)
+            files = [os.path.join(d, x) for x in os.listdir(d)]
+            if r.returncode != 0 or not files:
+                die(f"paperless download {a.id} failed: {(r.stderr or r.stdout).strip()[:300]}")
+            res = extract(files[0], a.text_chars)
+            res["file"] = f"paperless #{a.id}"
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+    missing = [k for k in ("payee", "amount", "due") if not res.get(k)]
+    res["needs_review"] = bool(missing) or any(v == "low" for v in res["confidence"].values())
+    args = ["bills", "add", "--payee", res.get("payee") or "?", "--amount", res.get("amount") or "?",
+            "--currency", res.get("currency") or "CHF", "--due", res.get("due") or "?"]
+    if res.get("reference"):
+        args += ["--ref", res["reference"]]
+    if res.get("iban"):
+        args += ["--iban", res["iban"]]
+    args += ["--paperless", str(a.id), "--source", "pdf"]
+    res["suggested_add"] = " ".join(shlex.quote(x) for x in args)
+    print(json.dumps(res, indent=1, ensure_ascii=False))
+    return 0
+
+
+# ================================================================ paperless scan (autopilot, read-only on paperless)
+#
+# New documents (by "added") → skip ones already linked to a bill and obvious non-bills (payslips, contracts,
+# receipts: metadata only, no content read) → for the rest the vault's whitelisted fields (QR code, amount, due date,
+# payee, has_payment_ref; tier 1 only: no IBAN/reference, no document text enters this box) + bill words in title/type/tags or a full-text search hit
+# → `bills add --source paperless --source-id paperless:ID`. Uncertain ones are listed as "to check", never guessed.
+
+PSCAN = os.path.join(STATE, "paperless-scan.json")
+INBOX = os.environ.get("BILLS_INBOX") or os.path.expanduser("~/inbox")
+SCAN_FIELDS = "amount,currency,due_date,payee,invoice_date,qr_bill,has_payment_ref,correspondent,title,document_type"
+BILL_WORDS = re.compile(r"(?i)(?<!ab)rechnung|invoice|factur|fattura|mahnung|zahlungserinnerung|payment reminder|"
+                        r"rappel|zahlungsaufforderung|zahlungsbefehl|betreibung|zahlbar|einzahlungsschein|qr-?bill|"
+                        r"\bbill\b|f[äa]llig")
+DUN_WORDS = re.compile(r"(?i)mahnung|zahlungserinnerung|payment reminder|rappel|zahlungsaufforderung|"
+                       r"zahlungsbefehl|betreibung|letzte erinnerung")
+NOT_BILL_WORDS = re.compile(r"(?i)lohnabrechnung|lohnausweis|salary certificate|certificat de salaire|payslip|"
+                            r"gehaltsabrechnung|arbeitsvertrag|vertrag|zeugnis|k[üu]ndigung|police|quittung|kassenbon|"
+                            r"kaufbeleg|receipt|gutschrift|zahlungsbest[äa]tigung|kontoauszug|steuerausweis|"
+                            r"zinsausweis|depotauszug|\bbezahlt\b|\bpaid\b")
+# Full-text queries (paperless/whoosh syntax, ANDed with an added:[since to now] range; vault caps q at 300 chars).
+CONTENT_Q = ('Rechnung OR Rechnungsbetrag OR Rechnungsdatum OR Rechnungsnummer OR Mahnung OR Zahlungserinnerung OR '
+             'Zahlteil OR Empfangsschein OR Einzahlungsschein OR "zahlbar bis" OR "zahlbar innert" OR Invoice OR '
+             '"amount due" OR Facture')
+DUN_Q = 'Mahnung OR Zahlungserinnerung OR "payment reminder" OR Zahlungsbefehl OR Rappel'
+STALE_DAYS = 14          # due more than this long ago: an archived, probably paid bill → skip, don't nag
+
+
+def _paperless(*args, timeout=600):
+    exe = os.environ.get("BILLS_PAPERLESS") or os.path.expanduser("~/bin/paperless")
+    try:
+        r = subprocess.run([exe, *args], capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"paperless {args[0]} timed out after {timeout}s")
+    if r.returncode != 0:
+        raise RuntimeError(f"paperless {args[0]} failed: {(r.stderr or r.stdout).strip()[:300]}")
+    return r.stdout
+
+
+def _pscan_load():
+    try:
+        with open(PSCAN) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"last_scan": None, "docs": {}, "failures": 0}
+
+
+def _pscan_save(s):
+    os.makedirs(STATE, exist_ok=True)
+    with open(PSCAN + ".tmp", "w") as f:
+        json.dump(s, f, indent=1, ensure_ascii=False)
+    os.replace(PSCAN + ".tmp", PSCAN)
+
+
+def _new_docs(since):
+    """Documents added on/after `since` (metadata only), newest first."""
+    n = 100
+    while True:
+        docs = json.loads(_paperless("recent", "-n", str(n), "--json"))["results"]
+        if len(docs) < n or (docs[-1].get("added") or "") < since or n >= 5000:
+            return [d for d in docs if (d.get("added") or "") >= since]
+        n = min(n * 5, 5000)
+
+
+def _search_ids(q, since):
+    d = json.loads(_paperless("search", f"({q}) added:[{since} to now]", "-n", "100", "--json"))
+    return {x["id"] for x in d.get("results") or []}
+
+
+def _meta_text(d):
+    return " | ".join([d.get("title") or "", d.get("document_type") or "", d.get("correspondent") or ""]
+                      + list(d.get("tags") or []))
+
+
+def scan_decide(d, f, content_hit, dun_hit):
+    """(verdict, info) for one document from its metadata `d`, vault fields `f` and the search hits.
+    verdict: 'bill' (info = add args), 'review' (likely a bill, data missing), 'skip'."""
+    meta = _meta_text(d)
+    pos, qr = bool(BILL_WORDS.search(meta)), bool(f.get("qr_bill"))
+    amount, due = f.get("amount"), f.get("due_date")
+    has_pay = bool(f.get("has_payment_ref") or f.get("iban") or f.get("reference"))   # iban/ref: older vaults
+    if not (pos or qr or content_hit):
+        return "skip", "no bill signs"
+    if not qr and NOT_BILL_WORDS.search(d.get("title") or ""):
+        return "skip", "title says receipt/paid/contract"
+    if not (pos or qr) and not (amount or has_pay):
+        return "skip", "bill words in the text, but no payment data"
+    missing = [k for k, v in (("amount", amount), ("due date", due)) if not v]
+    if missing:
+        return "review", "no " + " / ".join(missing) + (" (QR slip)" if qr else "")
+    if not (pos or qr or has_pay):
+        return "review", "bill words + amount, but no QR code / IBAN / reference"
+    try:
+        amt, due_d = parse_amount(amount), parse_day(due)
+    except ValueError as e:
+        return "review", f"unreadable field ({e})"
+    if amt <= 0:
+        return "review", f"amount {amount}"
+    if due_d < today() - timedelta(days=STALE_DAYS):
+        return "skip", f"old bill (due {due_d}), probably paid"
+    payee = f.get("payee") or d.get("correspondent") or f.get("correspondent")
+    conf = f.get("_confidence") or {}
+    check = [k.replace("due_date", "due") for k in ("payee", "amount", "due_date") if conf.get(k) == "low"]
+    if not payee:
+        payee, check = (d.get("title") or f"paperless #{d['id']}")[:60], check + ["payee"]
+    dun = dun_hit or bool(DUN_WORDS.search(meta))
+    note = "auto: paperless scan" + ("; Mahnung" if dun else "") + (f"; check {', '.join(check)}" if check else "")
+    return "bill", {"payee": payee, "amount": str(amt), "currency": (f.get("currency") or "CHF").upper(),
+                    "due": due_d.isoformat(), "ref": f.get("reference") or "", "iban": f.get("iban") or "",
+                    "has_payment_ref": has_pay, "note": note, "dunning": dun, "check": check}
+
+
+def _add_bill(doc_id, b):
+    args = [sys.executable, os.path.abspath(__file__), "add", "--payee", b["payee"], "--amount", b["amount"],
+            "--currency", b["currency"], "--due", b["due"], "--paperless", str(doc_id), "--source", "paperless",
+            "--source-id", f"paperless:{doc_id}", "--note", b["note"]]
+    if b["ref"]:
+        args += ["--ref", b["ref"]]
+    if b["iban"]:
+        args += ["--iban", b["iban"]]
+    r = subprocess.run(args, capture_output=True, text=True, timeout=120)
+    out = (r.stdout or "").strip()
+    m = re.match(r"(added|exists) #(\d+)", out)
+    if r.returncode not in (0, 3) or not m:
+        raise RuntimeError(f"bills add failed: {(r.stderr or out).strip()[:300]}")
+    return m.group(1), int(m.group(2)), out
+
+
+def _inbox_note(name, text):
+    os.makedirs(INBOX, exist_ok=True)
+    path = os.path.join(INBOX, f"{name}-{int(now().timestamp())}-{os.getpid()}.md")
+    with open(path, "w") as f:
+        f.write(text.rstrip("\n") + "\n")
+    return path
+
+
+def cmd_scan_paperless(a):
+    with Locked(PSCAN):
+        return _scan_paperless(a)
+
+
+def _scan_paperless(a):
+    s = _pscan_load()
+    explicit = bool(a.since)
+    if explicit:
+        try:
+            since = parse_day(a.since)
+        except ValueError as e:
+            die(str(e), 2)
+    elif s.get("last_scan"):
+        since = parse_day(s["last_scan"][:10]) - timedelta(days=2)
+    else:
+        since = today() - timedelta(days=60)
+    since = since.isoformat()
+    tracked = {b.get("paperless"): b["id"] for b in load()["bills"] if b.get("paperless")}
+    try:
+        docs = _new_docs(since)
+        content_ids = _search_ids(CONTENT_Q, since) if docs else set()
+        dun_ids = _search_ids(DUN_Q, since) if docs else set()
+    except (RuntimeError, ValueError, KeyError) as e:
+        print(f"bills scan-paperless: {e}", file=sys.stderr)
+        if not a.dry_run:
+            s["failures"] = s.get("failures", 0) + 1
+            _pscan_save(s)
+            if a.cron and s["failures"] == 3:
+                _inbox_note("bills-paperless-error", f"bills scan-paperless (cron) failed 3 runs in a row; "
+                            f"last error: {e}\nCheck `vault status` / `paperless recent`. No owner message needed "
+                            f"unless it stays broken.")
+        return 1
+    results, errors = [], 0
+    for d in sorted(docs, key=lambda x: x["id"]):
+        i, key = d["id"], str(d["id"])
+        r = {"id": i, "title": d.get("title"), "added": d.get("added")}
+        if i in tracked:
+            r.update(verdict="skip", why=f"already tracked as bill #{tracked[i]}")
+        elif key in s["docs"] and not explicit:
+            continue                                  # decided in an earlier scan
+        elif NOT_BILL_WORDS.search(_meta_text(d)) and not BILL_WORDS.search(_meta_text(d)):
+            r.update(verdict="skip", why=f"not a bill ({d.get('document_type') or d.get('title')})")
+        else:
+            try:
+                f = json.loads(_paperless("fields", key, "--fields", SCAN_FIELDS, timeout=1800))
+            except (RuntimeError, ValueError) as e:
+                r.update(verdict="error", why=str(e))
+                errors += 1
+                results.append(r)
+                continue
+            verdict, info = scan_decide(d, f, i in content_ids, i in dun_ids)
+            r["verdict"] = verdict
+            if verdict == "bill":
+                r["bill"] = {k: v for k, v in info.items() if k not in ("iban", "ref")}
+                if not a.dry_run:
+                    try:
+                        what, bid, out = _add_bill(i, info)
+                        r.update(verdict="added" if what == "added" else "exists", bill_id=bid, out=out)
+                    except (RuntimeError, subprocess.TimeoutExpired) as e:
+                        r.update(verdict="error", why=str(e))
+                        errors += 1
+            else:
+                r["why"] = info
+        results.append(r)
+        if not a.dry_run and r["verdict"] != "error":
+            s["docs"][key] = {"at": now().strftime("%Y-%m-%d %H:%M"), "verdict": r["verdict"],
+                              **({"bill": r["bill_id"]} if "bill_id" in r else {}),
+                              **({"why": r["why"]} if r.get("why") else {})}
+    if not a.dry_run:
+        s["failures"] = 0
+        if not errors:
+            s["last_scan"] = now().strftime("%Y-%m-%d %H:%M")
+        _pscan_save(s)
+
+    added = [r for r in results if r["verdict"] == "added"]
+    review = [r for r in results if r["verdict"] == "review"]
+    if a.json:
+        print(json.dumps({"since": since, "dry_run": a.dry_run, "docs": len(docs), "results": results},
+                         indent=1, ensure_ascii=False))
+    else:
+        def bill_txt(r):
+            b = r["bill"]
+            return (f"{b['payee']} {fmt_amount(b['currency'], b['amount'])}, due {fmt_day(b['due'])}"
+                    + (" — Mahnung" if b["dunning"] else "") + (f" (check {', '.join(b['check'])})" if b["check"] else ""))
+        n_bill = sum(r["verdict"] in ("bill", "added") for r in results)
+        print(f"paperless scan since {since}{' (dry run)' if a.dry_run else ''}: {len(docs)} doc(s) added, "
+              f"{len(results)} checked → {n_bill} bill(s){'' if a.dry_run else f' ({len(added)} new)'}, "
+              f"{len(review)} to check, {errors} error(s)")
+        for r in results:
+            v = r["verdict"]
+            if v == "bill":
+                print(f"  would add: {bill_txt(r)}  [paperless #{r['id']}]")
+            elif v in ("added", "exists"):
+                print(f"  {v} #{r['bill_id']}: {bill_txt(r)}  [paperless #{r['id']}]")
+            elif v == "review":
+                print(f"  to check: paperless #{r['id']} \"{r['title']}\": {r['why']} → bills from-paperless {r['id']}")
+            elif v == "error":
+                print(f"  error: paperless #{r['id']}: {r['why']}")
+            elif a.verbose:
+                print(f"  skip: paperless #{r['id']} \"{r['title']}\": {r['why']}")
+    if a.cron and not a.dry_run:
+        note = scan_note(added, review, set(a.filed))
+        if note:
+            _inbox_note("bills-paperless", note)
+    return 1 if errors else 0
+
+
+def filed_ids(v):
+    try:
+        ids = tuple(int(x) for x in str(v).split(",") if x.strip())
+    except ValueError:
+        raise argparse.ArgumentTypeError("--filed takes paperless document ids: 12,13")
+    if not ids or any(i <= 0 for i in ids):
+        raise argparse.ArgumentTypeError("--filed takes paperless document ids: 12,13")
+    return ids
+
+
+def scan_note(added, review, filed=()):
+    """The ~/inbox note text for a --cron scan, or None. Daily scan: only when bills were added (review items ride
+    along). Feed-triggered (--filed, the owner just filed documents via the vault bot and already got its "Filed as
+    #N" line): when bills were added or one of the just-filed documents needs checking; he is messaged only about
+    the to-check ones (plan D: "I message him only for 'to check' items")."""
+    def bill_line(r):
+        b = r["bill"]
+        return (f"- #{r['bill_id']} {b['payee']} {fmt_amount(b['currency'], b['amount'])}, due {fmt_day(b['due'])} "
+                f"(paperless #{r['id']})" + (" — Mahnung" if b["dunning"] else "")
+                + (f" — check {', '.join(b['check'])}" if b["check"] else "")
+                + ("" if not filed or r["id"] in filed else " — not via the vault bot: tell him"))
+    if not filed:
+        if not added:
+            return None
+        lines = [f"bills scan-paperless (cron): {len(added)} new bill(s) from paperless added to the tracker "
+                 f"(reminders set). Tell the owner in ONE short message; ask him to check flagged ones.", ""]
+        lines += [bill_line(r) for r in added]
+        if review:
+            lines += ["", "Also likely bills with missing data (look with `bills from-paperless ID`):"]
+            lines += [f"- paperless #{r['id']} \"{r['title']}\": {r['why']}" for r in review]
+        return "\n".join(lines)
+    check = [r for r in review if r["id"] in filed]
+    flagged = [r for r in added if r["bill"]["check"] or r["id"] not in filed]
+    if not (added or check):
+        return None
+    lines = [f"bills scan-paperless (vault bot intake): the owner filed paperless #"
+             f"{', #'.join(str(i) for i in sorted(filed))} via the vault bot and already got its \"Filed as #N\" "
+             f"line. Tracker: {len(added)} bill(s) added (reminders set), {len(check)} to check.",
+             "Message him only about the items marked check / to check / tell him (one short message); the rest "
+             "needs no message." if (check or flagged) else "No message needed: the vault bot already told him.", ""]
+    if added:
+        lines += ["Added:"] + [bill_line(r) for r in added]
+    if check:
+        lines += ["", "To check (likely bills with missing data; never ask him for IBAN/reference, he pays from the "
+                      "QR code; look with `bills from-paperless ID`):"]
+        lines += [f"- paperless #{r['id']} \"{r['title']}\": {r['why']}" for r in check]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    p = argparse.ArgumentParser(prog="bills", description=__doc__.split("\n\n")[0],
+                                formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
+    sp = p.add_subparsers(dest="cmd", required=True)
+    ad = sp.add_parser("add")
+    ad.add_argument("--payee", required=True)
+    ad.add_argument("--amount", required=True)
+    ad.add_argument("--currency", default="CHF")
+    ad.add_argument("--due", required=True, help="YYYY-MM-DD")
+    ad.add_argument("--ref", default="")
+    ad.add_argument("--iban", default="")
+    ad.add_argument("--paperless", type=int)
+    ad.add_argument("--source", choices=SOURCES, default="manual")
+    ad.add_argument("--source-id", help="e.g. the Gmail message id (deduplicates too)")
+    ad.add_argument("--note")
+    ad.add_argument("--no-remind", action="store_true", help="e.g. eBill with standing approval / direct debit")
+    pd = sp.add_parser("paid"); pd.add_argument("bill"); pd.add_argument("--date")
+    ls = sp.add_parser("list")
+    g = ls.add_mutually_exclusive_group()
+    g.add_argument("--open", action="store_true"); g.add_argument("--all", action="store_true")
+    g.add_argument("--week", action="store_true")
+    ls.add_argument("--json", action="store_true")
+    sp.add_parser("week")
+    sh = sp.add_parser("show"); sh.add_argument("bill"); sh.add_argument("--json", action="store_true")
+    ed = sp.add_parser("edit"); ed.add_argument("bill")
+    for f in ("payee", "amount", "currency", "due", "ref", "iban", "note"):
+        ed.add_argument(f"--{f}")
+    ed.add_argument("--paperless", type=int)
+    rm = sp.add_parser("remove"); rm.add_argument("bill")
+    ex = sp.add_parser("extract"); ex.add_argument("file"); ex.add_argument("--text-chars", type=int, default=4000)
+    fp = sp.add_parser("from-paperless"); fp.add_argument("id", type=int)
+    fp.add_argument("--text-chars", type=int, default=4000, help="direct mode only")
+    gs = sp.add_parser("gmail-state")
+    gs.add_argument("--done", action="store_true", help="record that a scan finished now")
+    gs.add_argument("--seen", nargs="+", metavar="MSGID", help="message ids handled (bills or not)")
+    sc = sp.add_parser("scan-paperless", help="add likely bills from new paperless documents")
+    sc.add_argument("--since", help="YYYY-MM-DD: scan documents added since then, re-checking ones seen before "
+                    "(default: last scan - 2 days; first run: 60 days)")
+    sc.add_argument("--dry-run", action="store_true", help="add nothing, keep no state")
+    sc.add_argument("--json", action="store_true")
+    sc.add_argument("-v", "--verbose", action="store_true", help="also list skipped documents")
+    sc.add_argument("--cron", action="store_true", help="write an ~/inbox note when bills were added")
+    sc.add_argument("--filed", type=filed_ids, default=(),
+                    help="ID,ID: documents the owner just filed via the vault bot (vault-events); with --cron the "
+                         "note says he already got the bot's line and also comes when one of them needs checking")
+    a = p.parse_args()
+    return {"add": cmd_add, "paid": cmd_paid, "list": cmd_list, "week": cmd_week, "show": cmd_show,
+            "edit": cmd_edit, "remove": cmd_remove, "extract": cmd_extract, "from-paperless": cmd_from_paperless,
+            "gmail-state": cmd_gmail_state, "scan-paperless": cmd_scan_paperless}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

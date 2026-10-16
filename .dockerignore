@@ -1,0 +1,8 @@
+.env
+*.pyc
+__pycache__/
+**/firefly_rules.json
+**/*.private.json
+docs/
+tools/
+.github/

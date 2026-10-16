@@ -1,0 +1,6 @@
+# eval_answers.py runs over the whole set (real model: Gemma-4-26B-A4B in the vault; today fixed Thu 2026-10-15)
+# date        code        cases  yesno  when  who  count  short  total        note
+2026-10-15    answer-6    29     13/15  4/4   1/4  3/3    3/3    24/29 0.83   before: past-only hits -> unclear (en, gsw); who lists the sender who only reports
+2026-10-15    answer-7    29     15/15  4/4   4/4  3/3    3/3    29/29 1.00   yesno + who prompt wording, settle(); 3 held-out cases also pass (old 2/3)
+2026-10-15    answer-10   29     15/15  4/4   4/4  3/3    3/3    29/29 1.00   C4 gate (hybrid retrieval, 92d79df): no regression; ask p95 keyword 139.3 s -> hybrid 115.5 s
+2026-10-15    answer-10   29     15/15  4/4   4/4  3/3    3/3    29/29 1.00   llama.cpp b11606 -> b11669 (b5e4b61): no regression; whole set 208 s

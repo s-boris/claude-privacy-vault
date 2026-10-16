@@ -1,0 +1,15 @@
+### item 1
+Subject: Your receipt from Apple
+Total $108.34 Billed to Visa ending in [card number]. Thanks for your purchase.
+### item 2
+Subject: Ihre Zahlung an Netflix
+Betrag USD 12.00 wurde am 12.10.2026 belastet.
+### item 3
+Subject: Rechnung Oktober
+Rechnungsbetrag CHF 1'234.50, zahlbar bis 30.10.2026. Termin am 21.10. um 10.30 Uhr.
+### item 4
+Subject: Bestellbestätigung #112-3456789
+Ihr Artikel € 9,99 wird am 18.10.2026 geliefert. 20% Rabatt auf 2 Artikel.
+### item 5
+Subject: Order summary
+Total: 45.00

@@ -1,0 +1,35 @@
+#!/usr/bin/python3 -I
+"""llm-ctl: LLM_LOCAL_CTL for llm-local inside the vault. vaultd's supervisor owns llama-server, so `start`/`ensure`
+only wait (up to 280 s) for it to become healthy; `status` prints up/down; `stop` is refused."""
+import json
+import os
+import sys
+import time
+import urllib.request
+
+PORT = int(os.environ.get('LLM_LOCAL_PORT', '8179'))
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def healthy():
+    try:
+        with OPENER.open(f'http://127.0.0.1:{PORT}/health', timeout=3) as r:
+            return json.loads(r.read() or b'{}').get('status') == 'ok'
+    except Exception:
+        return False
+
+
+cmd = sys.argv[1] if len(sys.argv) > 1 else 'status'
+if cmd in ('start', 'ensure'):
+    end = time.time() + 280
+    while time.time() < end:
+        if healthy():
+            sys.exit(0)
+        time.sleep(2)
+    print('llm-ctl: the vault\'s llama-server is not up (see `vault status`)', file=sys.stderr)
+    sys.exit(1)
+if cmd == 'status':
+    print('up' if healthy() else 'down')
+    sys.exit(0 if healthy() else 3)
+print(f'llm-ctl: {cmd}: not available in the vault (vaultd supervises llama-server)', file=sys.stderr)
+sys.exit(2)
